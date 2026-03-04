@@ -9,132 +9,203 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function safeJsonStringify(obj) {
+function safeStringify(obj) {
   try { return JSON.stringify(obj); } catch { return ''; }
 }
 
-function deepScan(obj) {
-  // Collect some signals from an unknown JSON schema
-  const out = {
-    hasEventsArray: false,
-    hasHistory: false,
-    hasMilestones: false,
-    hasStatusKey: false,
-    stringHits: {
-      delivered: 0,
-      outForDelivery: 0,
-      gotIt: 0,
-      notRecognised: 0
-    }
-  };
-
-  const seen = new Set();
-  const stack = [obj];
-
-  while (stack.length) {
-    const cur = stack.pop();
-    if (!cur || typeof cur !== 'object') continue;
-    if (seen.has(cur)) continue;
-    seen.add(cur);
-
-    if (Array.isArray(cur)) {
-      // Heuristic: arrays of objects that include date/time/location/status often represent events
-      if (cur.length && cur.some(x => x && typeof x === 'object')) {
-        // weak signal, refined by key checks below
-      }
-      for (const v of cur) stack.push(v);
-      continue;
-    }
-
-    for (const [k, v] of Object.entries(cur)) {
-      const lk = String(k).toLowerCase();
-
-      if (lk === 'events' && Array.isArray(v)) out.hasEventsArray = true;
-      if (lk.includes('event') && Array.isArray(v)) out.hasEventsArray = true;
-      if (lk.includes('history')) out.hasHistory = true;
-      if (lk.includes('milestone')) out.hasMilestones = true;
-      if (lk === 'status' || lk.includes('currentstatus') || lk.includes('trackingstatus')) out.hasStatusKey = true;
-
-      if (typeof v === 'string') {
-        const t = v.toLowerCase().replace(/['’]/g, '');
-        if (t.includes('delivered')) out.stringHits.delivered++;
-        if (t.includes('out for delivery') || t.includes('due to be delivered today')) out.stringHits.outForDelivery++;
-        if (t.includes("weve got it") || t.includes("we've got it") || t.includes('item received')) out.stringHits.gotIt++;
-        if (t.includes('not recognised') || t.includes('not recognized') || t.includes("we can't confirm") || t.includes('we cant confirm')) out.stringHits.notRecognised++;
-      } else if (v && typeof v === 'object') {
-        stack.push(v);
-      }
-    }
-  }
-
-  return out;
+function normalize(s) {
+  return String(s || '').toLowerCase().replace(/['’]/g, '').replace(/\s+/g, ' ').trim();
 }
 
-function classifyFromTrackingPayload(payload) {
-  // Use both deep scan + global string scan
-  const raw = safeJsonStringify(payload).toLowerCase().replace(/['’]/g, '');
+function classifyFromText(text) {
+  const t = normalize(text);
 
-  // Explicit failure
   if (
-    raw.includes('not recognised') ||
-    raw.includes('not recognized') ||
-    raw.includes("we cant confirm") ||
-    raw.includes("we can't confirm")
+    t.includes('not recognised') ||
+    t.includes('not recognized') ||
+    t.includes("we cant confirm") ||
+    t.includes("we can't confirm")
   ) return 'NOT_FOUND';
 
-  // Strong positives
-  if (raw.includes('out for delivery') || raw.includes('due to be delivered today')) return 'OUT_FOR_DELIVERY';
-  if (raw.includes('delivered on') || raw.includes('delivered to') || raw.includes('"delivered"')) return 'DELIVERED';
-  if (raw.includes("weve got it") || raw.includes("we've got it") || raw.includes('item received') || raw.includes('warrington mc'))
-    return 'WITH_COURIER';
+  if (t.includes('out for delivery') || t.includes('due to be delivered today')) return 'OUT_FOR_DELIVERY';
 
-  // Fallback to deep scan signals if wording varies
-  const scan = deepScan(payload);
-  if (scan.stringHits.delivered > 0) return 'DELIVERED';
-  if (scan.stringHits.outForDelivery > 0) return 'OUT_FOR_DELIVERY';
-  if (scan.stringHits.gotIt > 0) return 'WITH_COURIER';
-  if (scan.stringHits.notRecognised > 0) return 'NOT_FOUND';
+  if (t.includes('delivered on') || t.includes('delivered to')) return 'DELIVERED';
+
+  if (t.includes('weve got it') || t.includes("we've got it") || t.includes('item received') || t.includes('warrington mc'))
+    return 'WITH_COURIER';
 
   return 'UNKNOWN';
 }
 
+/**
+ * Walks ANY JSON schema and tries to find "best evidence" text for a specific tracking number.
+ * Strategy:
+ * - Look for any node (object/array) whose JSON string contains the trackingNumber (strong signal)
+ * - Within those nodes, collect strings that look like tracking statuses/events
+ * - Pick the best string and classify from it
+ */
+function extractTrackingEvidence(json, trackingNumber) {
+  const tn = normalize(trackingNumber);
+  const evidenceStrings = [];
+  let containsTrackingNumber = false;
+
+  const seen = new Set();
+  const stack = [{ value: json, path: '$' }];
+
+  const isStatusy = (s) => {
+    const t = normalize(s);
+    return (
+      t.includes('delivered') ||
+      t.includes('out for delivery') ||
+      t.includes('due to be delivered today') ||
+      t.includes('weve got it') ||
+      t.includes("we've got it") ||
+      t.includes('item received') ||
+      t.includes('posted') ||
+      t.includes('accepted') ||
+      t.includes('in transit') ||
+      t.includes('processing') ||
+      t.includes('ready for delivery') ||
+      t.includes('attempted delivery') ||
+      t.includes('delivery attempted') ||
+      t.includes('unable to deliver') ||
+      t.includes('not recognised') ||
+      t.includes('not recognized') ||
+      t.includes("we cant confirm") ||
+      t.includes("we can't confirm")
+    );
+  };
+
+  while (stack.length) {
+    const { value, path } = stack.pop();
+    if (!value) continue;
+
+    if (typeof value === 'string') {
+      // Collect status-like strings (we’ll filter by locality to tracking number below)
+      if (isStatusy(value)) evidenceStrings.push({ path, text: value });
+      continue;
+    }
+
+    if (typeof value !== 'object') continue;
+    if (seen.has(value)) continue;
+    seen.add(value);
+
+    // If this subtree contains the tracking number, mark it and harvest strings more aggressively.
+    const subtreeString = safeStringify(value);
+    const subtreeNorm = normalize(subtreeString);
+    const subtreeHasTN = tn.length > 0 && subtreeNorm.includes(tn);
+
+    if (subtreeHasTN) {
+      containsTrackingNumber = true;
+
+      // If subtree contains TN, pull all strings in that subtree (not just “statusy”),
+      // because some schemas store statuses as codes we still want to classify.
+      const subStack = [{ v: value, p: path }];
+      const subSeen = new Set();
+
+      while (subStack.length) {
+        const { v, p } = subStack.pop();
+        if (!v) continue;
+
+        if (typeof v === 'string') {
+          // Save both status-like and shorter informative strings
+          const txt = String(v);
+          const n = normalize(txt);
+          if (isStatusy(txt) || n.includes('delivered') || n.includes('out for delivery') || n.includes('weve got it')) {
+            evidenceStrings.push({ path: p, text: txt });
+          }
+          continue;
+        }
+
+        if (typeof v !== 'object') continue;
+        if (subSeen.has(v)) continue;
+        subSeen.add(v);
+
+        if (Array.isArray(v)) {
+          v.forEach((item, idx) => subStack.push({ v: item, p: `${p}[${idx}]` }));
+        } else {
+          for (const [k, vv] of Object.entries(v)) {
+            subStack.push({ v: vv, p: `${p}.${k}` });
+          }
+        }
+      }
+    }
+
+    // Continue normal traversal
+    if (Array.isArray(value)) {
+      value.forEach((item, idx) => stack.push({ value: item, path: `${path}[${idx}]` }));
+    } else {
+      for (const [k, v] of Object.entries(value)) {
+        stack.push({ value: v, path: `${path}.${k}` });
+      }
+    }
+  }
+
+  // Choose the “best” evidence string:
+  // - Prefer strings with delivered/out for delivery/we've got it etc.
+  // - Longer isn’t always better; prefer moderately sized messages
+  const ranked = evidenceStrings
+    .map((e) => {
+      const t = normalize(e.text);
+      let score = 0;
+
+      if (t.includes('delivered on') || t.includes('delivered to')) score += 50;
+      else if (t.includes('delivered')) score += 30;
+
+      if (t.includes('out for delivery') || t.includes('due to be delivered today')) score += 35;
+      if (t.includes('weve got it') || t.includes("we've got it") || t.includes('item received')) score += 20;
+
+      if (t.includes('not recognised') || t.includes('not recognized') || t.includes("we cant confirm") || t.includes("we can't confirm")) score += 40;
+
+      // prefer “message sized” strings (avoid giant app text blobs)
+      const len = t.length;
+      if (len > 20 && len < 240) score += 10;
+      if (len >= 240) score -= 10;
+
+      return { ...e, score };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  const best = ranked[0] || null;
+
+  return {
+    containsTrackingNumber,
+    bestEvidenceText: best ? best.text : null,
+    bestEvidencePath: best ? best.path : null,
+    bestEvidenceScore: best ? best.score : null,
+  };
+}
+
 function scoreJsonCandidate({ json, url }, trackingNumber) {
+  const raw = normalize(safeStringify(json));
+  const tn = normalize(trackingNumber);
+
   const topKeys = json && typeof json === 'object' ? Object.keys(json) : [];
-  const raw = safeJsonStringify(json).toLowerCase();
-  const tn = trackingNumber.toLowerCase();
 
-  const scan = deepScan(json);
+  const hasTN = tn && raw.includes(tn);
 
-  let score = 0;
-
-  // Biggest signal: payload contains the tracking number
-  if (raw.includes(tn)) score += 50;
-
-  // Prefer payloads that look like actual tracking content (events/milestones/history)
-  if (scan.hasEventsArray) score += 25;
-  if (scan.hasHistory) score += 15;
-  if (scan.hasMilestones) score += 15;
-  if (scan.hasStatusKey) score += 10;
-
-  // De-prioritize obvious config blobs
+  // Hard de-prioritize obvious config-only blobs (your exact case)
   const lowerKeys = topKeys.map(k => k.toLowerCase());
-  const looksLikeConfigOnly =
+  const isConfigBlob =
     lowerKeys.length <= 4 &&
     lowerKeys.includes('appconfig') &&
     lowerKeys.includes('apptext');
 
-  if (looksLikeConfigOnly) score -= 40;
-
-  // Small bump for “signal words” but not too much (config can contain them)
-  score += Math.min(10, scan.stringHits.delivered);
-  score += Math.min(10, scan.stringHits.outForDelivery);
-  score += Math.min(6, scan.stringHits.gotIt);
-  score += Math.min(6, scan.stringHits.notRecognised);
-
-  // Prefer the known Royal Mail JSON endpoint slightly, but not if it’s config-only
+  let score = 0;
+  if (hasTN) score += 100;            // MUST-have signal
+  if (url.includes('royalmail.com')) score += 3;
   if (url.includes('/spalp/rml_track_and_trace/json')) score += 5;
 
-  return { score, scan, topKeys };
+  if (isConfigBlob && !hasTN) score -= 80; // prevent false positives from UI text
+
+  // Mild bumps for status words (ONLY meaningful if hasTN)
+  if (hasTN) {
+    if (raw.includes('delivered')) score += 10;
+    if (raw.includes('out for delivery')) score += 10;
+    if (raw.includes("weve got it") || raw.includes("we've got it")) score += 6;
+  }
+
+  return { score, hasTN, topKeys: topKeys.slice(0, 25), isConfigBlob };
 }
 
 app.get('/api/track', async (req, res) => {
@@ -224,75 +295,83 @@ app.get('/api/track', async (req, res) => {
     logs.push('🖱️ Clicking "Track your delivery"...');
     const clickedTrack = await page.evaluate(() => {
       const btns = Array.from(document.querySelectorAll('button'));
-      const b = btns.find(x => /track your delivery/i.test((x.innerText || '').trim()))
-        || document.querySelector('button[type="submit"]');
+      const b =
+        btns.find(x => /track your delivery/i.test((x.innerText || '').trim())) ||
+        document.querySelector('button[type="submit"]');
       if (b) { b.click(); return true; }
       return false;
     });
     if (!clickedTrack) throw new Error('Submit button not found');
 
-    // Wait a bit for JSON calls to complete
+    // Wait for JSON responses
     logs.push('⏳ Waiting for JSON responses...');
     const start = Date.now();
     while (Date.now() - start < 20000) {
-      if (jsonResponses.length >= 2) break; // usually enough to score
+      if (jsonResponses.length >= 2) break;
       await sleep(300);
     }
     logs.push(`✅ Captured ${jsonResponses.length} JSON response(s).`);
 
-    // Pick best candidate based on trackingNumber + schema signals
-    let best = null;
-    let bestMeta = null;
-    const candidates = jsonResponses.map(r => {
-      const meta = scoreJsonCandidate(r, trackingNumber);
-      return {
-        url: r.url,
-        http_status: r.status,
-        top_keys: meta.topKeys.slice(0, 25),
-        score: meta.score,
-        signals: meta.scan,
-      };
-    }).sort((a, b) => b.score - a.score);
+    // Score candidates
+    const candidates = jsonResponses
+      .map((r) => {
+        const meta = scoreJsonCandidate(r, trackingNumber);
+        return {
+          url: r.url,
+          http_status: r.status,
+          top_keys: meta.topKeys,
+          score: meta.score,
+          has_tracking_number: meta.hasTN,
+          is_config_blob: meta.isConfigBlob,
+        };
+      })
+      .sort((a, b) => b.score - a.score);
 
-    if (jsonResponses.length) {
-      const top = candidates[0];
-      best = jsonResponses.find(r => r.url === top.url) || null;
-      bestMeta = top || null;
-    }
+    // Pick best, but ONLY trust if it contains tracking number
+    const best = candidates[0] ? jsonResponses.find(r => r.url === candidates[0].url) : null;
 
-    let currentStatus = 'UNKNOWN';
-    let trackingPayloadUsed = false;
+    let status = 'UNKNOWN';
+    let usedTrackingJson = false;
+    let evidence = null;
 
-    if (best && bestMeta && bestMeta.score >= 20) {
-      // Only trust it if it scores well enough (avoids config-only false positives)
-      currentStatus = classifyFromTrackingPayload(best.json);
-      trackingPayloadUsed = true;
-      logs.push(`🧩 Using JSON candidate: ${best.url}`);
-      logs.push(`🧠 Candidate score: ${bestMeta.score}`);
+    if (best) {
+      const ev = extractTrackingEvidence(best.json, trackingNumber);
+      evidence = ev;
+
+      if (ev.containsTrackingNumber) {
+        status = classifyFromText(ev.bestEvidenceText || safeStringify(best.json));
+        usedTrackingJson = true;
+        logs.push(`🧩 Using tracking JSON: ${best.url}`);
+        logs.push(`🧠 Evidence path: ${ev.bestEvidencePath || 'n/a'}`);
+      } else {
+        // We refuse to guess from config/copy
+        status = 'NO_TRACKING_DATA';
+        logs.push(`⚠️ Best JSON did NOT contain the tracking number; refusing to guess from UI copy.`);
+      }
     } else {
-      logs.push('⚠️ No high-confidence tracking JSON found; falling back to page text (less reliable).');
-      const pageText = await page.evaluate(() => document.body?.innerText || '');
-      currentStatus = (pageText ? 'UNKNOWN' : 'UNKNOWN'); // keep unknown; you can add a text classifier if you want
+      status = 'NO_TRACKING_DATA';
+      logs.push(`⚠️ No JSON candidates captured; no tracking data.`);
     }
 
-    // Include some UI text for debugging, but don’t use it as primary truth
+    // For debugging only (don’t use this to classify unless you choose to)
     const pageText = await page.evaluate(() => document.body?.innerText || '');
 
-    logs.push(`🏁 Final Status: ${currentStatus}`);
+    logs.push(`🏁 Final Status: ${status}`);
 
     await browser.close();
 
     return res.json({
       tracking: trackingNumber,
-      status: currentStatus,
+      status,
       logs,
       debug: {
         json_count: jsonResponses.length,
-        used_tracking_payload: trackingPayloadUsed,
+        used_tracking_json: usedTrackingJson,
         best_json_url: best?.url || null,
-        best_score: bestMeta?.score ?? null,
-        best_json_top_keys: bestMeta?.top_keys || null,
-        candidates: candidates.slice(0, 7), // top 7 for inspection
+        evidence_contains_tracking_number: evidence?.containsTrackingNumber ?? null,
+        evidence_best_path: evidence?.bestEvidencePath ?? null,
+        evidence_best_text: evidence?.bestEvidenceText ? String(evidence.bestEvidenceText).slice(0, 300) : null,
+        candidates: candidates.slice(0, 10),
       },
       debug_text: pageText.substring(0, 2000),
     });
