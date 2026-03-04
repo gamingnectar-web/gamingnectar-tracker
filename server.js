@@ -1,15 +1,11 @@
 const express = require('express');
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-core'); 
 const cors = require('cors');
 
 const app = express();
 
-// Tell the browser bouncer: "Let Shopify in!"
-app.use(cors({
-  origin: '*' // Note: Using '*' for testing so it definitely connects. We can lock this down to 'gamingnectar.com' later.
-}));
+app.use(cors({ origin: '*' }));
 
-// Create the route that Shopify will call
 app.get('/api/track', async (req, res) => {
   const trackingNumber = req.query.number;
   
@@ -17,30 +13,37 @@ app.get('/api/track', async (req, res) => {
     return res.status(400).json({ error: 'Missing tracking number' });
   }
 
-  console.log(`🤖 Starting scrape for: ${trackingNumber}`);
+  console.log(`🤖 Dialing Browserless to scrape: ${trackingNumber}`);
 
   try {
-    // Launch the invisible robot browser
-    const browser = await puppeteer.launch({ 
-      headless: "new",
-      args: ['--no-sandbox', '--disable-setuid-sandbox'] // Crucial for hosting on free servers
+    // Connect to Browserless remote server
+    const browser = await puppeteer.connect({
+      browserWSEndpoint: `wss://chrome.browserless.io?token=YOUR_BROWSERLESS_API_KEY_HERE`
     });
+    
     const page = await browser.newPage();
     
-    // Go to Royal Mail and WAIT for the network to finish loading the JS
+    // Go to Royal Mail and wait for it to load
     const url = `https://www.royalmail.com/track-your-item#/tracking-results/${trackingNumber}`;
     await page.goto(url, { waitUntil: 'networkidle2' });
     
-    // Extract all the text from the fully rendered page
+    // Grab the text
     const pageText = await page.evaluate(() => document.body.innerText);
     await browser.close();
 
-    // Check for our magic words
-    if (pageText.includes("Delivered") || pageText.includes("We've got it")) {
-      res.json({ tracking: trackingNumber, status: 'DELIVERED' });
-    } else {
-      res.json({ tracking: trackingNumber, status: 'IN_TRANSIT' });
+    const text = pageText.toLowerCase();
+    let currentStatus = 'UNKNOWN';
+
+    // Check our 3 Milestones
+    if (text.includes("delivered")) {
+      currentStatus = 'DELIVERED';
+    } else if (text.includes("out for delivery") || text.includes("due to be delivered today")) {
+      currentStatus = 'OUT_FOR_DELIVERY';
+    } else if (text.includes("we've got it") || text.includes("in transit") || text.includes("accepted at")) {
+      currentStatus = 'WITH_COURIER';
     }
+
+    res.json({ tracking: trackingNumber, status: currentStatus });
 
   } catch (error) {
     console.error("Scrape failed:", error);
@@ -48,7 +51,6 @@ app.get('/api/track', async (req, res) => {
   }
 });
 
-// Start the server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Tracking API running on port ${PORT}`);
