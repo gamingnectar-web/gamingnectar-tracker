@@ -9,7 +9,7 @@ app.get('/api/track', async (req, res) => {
   const trackingNumber = req.query.number;
   if (!trackingNumber) return res.status(400).json({ error: 'Missing tracking number' });
 
-  console.log(`🤖 Dialing Browserless to scrape: ${trackingNumber}`);
+  console.log(`🤖 Starting Human-Emulator for: ${trackingNumber}`);
 
   try {
     const browser = await puppeteer.connect({
@@ -17,33 +17,28 @@ app.get('/api/track', async (req, res) => {
     });
     
     const page = await browser.newPage();
-    // Use a desktop-like user agent to avoid mobile-specific cookie popups
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36');
-    
-    const url = `https://www.royalmail.com/track-your-item#/tracking-results/${trackingNumber}`;
-    await page.goto(url, { waitUntil: 'networkidle2' });
-    
-    // 🛑 X-RAY FIX: Wait specifically for the results to load behind the cookie banner
-    try {
-      await page.waitForFunction(
-        () => document.body.innerText.includes('Tracking number'),
-        { timeout: 15000 }
-      );
-    } catch (e) {
-      console.log("Timed out waiting for content. Status might still be loading.");
-    }
 
-    // Give it 2 extra seconds for the status text to fully animate in
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    // 1. Go to the empty tracking page
+    await page.goto('https://www.royalmail.com/track-your-item#/', { waitUntil: 'networkidle2' });
+
+    // 2. Type the tracking number into the box (mimicking a human)
+    await page.waitForSelector('input[name="trackNumber"]', { timeout: 10000 });
+    await page.type('input[name="trackNumber"]', trackingNumber, { delay: 100 });
+
+    // 3. Click the "Track your delivery" button
+    await page.click('button.rm-button-primary');
+
+    // 4. Wait for the actual results to appear
+    await new Promise(resolve => setTimeout(resolve, 5000));
     
     const pageText = await page.evaluate(() => document.body.innerText);
     await browser.close();
 
-    // Strip apostrophes and prep text
     const text = pageText.toLowerCase().replace(/['’]/g, "");
     let currentStatus = 'UNKNOWN';
 
-    // Search for milestones
+    // Milestone Detection
     if (text.includes("delivered on") || text.includes("delivered to") || text.includes("has been delivered")) {
       currentStatus = 'DELIVERED';
     } else if (text.includes("out for delivery") || text.includes("due to be delivered today")) {
@@ -55,15 +50,14 @@ app.get('/api/track', async (req, res) => {
     res.json({ 
       tracking: trackingNumber, 
       status: currentStatus,
-      // Increased to 4000 so we can definitely see the status in our debug window
-      debug_text: pageText.substring(0, 4000) 
+      debug_text: pageText.substring(0, 2000) 
     });
 
   } catch (error) {
-    console.error("Scrape failed:", error);
+    console.error("Human-Emulator failed:", error);
     res.status(500).json({ error: 'Failed to scrape Royal Mail' });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Tracking API running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Human-Emulator API running on port ${PORT}`));
