@@ -18,7 +18,7 @@ app.get('/api/track', async (req, res) => {
   try {
     // Connect to Browserless remote server
     const browser = await puppeteer.connect({
-      browserWSEndpoint: `wss://chrome.browserless.io?token=YOUR_BROWSERLESS_API_KEY_HERE`
+      browserWSEndpoint: `wss://chrome.browserless.io?token=2U5O4xleNcnBPTae50d62ee196bc350092b3c172fc66d1bdb`
     });
     
     const page = await browser.newPage();
