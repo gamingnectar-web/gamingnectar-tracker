@@ -9,7 +9,7 @@ app.get('/api/track', async (req, res) => {
   const trackingNumber = req.query.number;
   if (!trackingNumber) return res.status(400).json({ error: 'Missing tracking number' });
 
-  console.log(`🤖 Targeting Royal Mail with Cookie-Bypass for: ${trackingNumber}`);
+  console.log(`🤖 Force-Submit Strategy for: ${trackingNumber}`);
 
   let browser;
   try {
@@ -21,27 +21,25 @@ app.get('/api/track', async (req, res) => {
     await page.setViewport({ width: 1280, height: 1000 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
 
-    const url = `https://www.royalmail.com/track-your-item#/tracking-results/${trackingNumber}`;
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+    // 1. Start at the clean search page
+    await page.goto('https://www.royalmail.com/track-your-item#/', { waitUntil: 'networkidle2', timeout: 30000 });
 
-    // 🛑 STEP 1: Click the "Accept All" Cookie Button
+    // 2. Click your specific TrustArc button ID to clear the overlay
     try {
-      await page.waitForSelector('#truste-consent-button', { timeout: 8000 });
+      await page.waitForSelector('#truste-consent-button', { timeout: 5000 });
       await page.click('#truste-consent-button');
-      console.log("✅ Cookie banner dismissed.");
-      // Short pause to let the banner animation finish
       await new Promise(resolve => setTimeout(resolve, 1000));
-    } catch (e) {
-      console.log("⚠️ Cookie banner didn't appear or was already gone.");
-    }
+    } catch (e) { console.log("Cookie banner already gone."); }
 
-    // 🛑 STEP 2: Wait for the Status Description to appear
+    // 3. Type the number into the first input and hit Enter
+    await page.waitForSelector('input', { timeout: 10000 });
+    await page.type('input', trackingNumber, { delay: 150 });
+    await page.keyboard.press('Enter');
+
+    // 4. Wait specifically for your status-description div to appear
     try {
-      await page.waitForSelector('.status-description', { timeout: 10000 });
-      console.log("✅ Status info found on page.");
-    } catch (e) {
-      console.log("⚠️ Could not find .status-description selector.");
-    }
+      await page.waitForSelector('.status-description', { timeout: 12000 });
+    } catch (e) { console.log("Still loading results..."); }
 
     const pageText = await page.evaluate(() => document.body.innerText);
     await browser.close();
@@ -49,7 +47,7 @@ app.get('/api/track', async (req, res) => {
     const text = pageText.toLowerCase().replace(/['’]/g, "");
     let currentStatus = 'UNKNOWN';
 
-    // Milestone Check (includes your specific "weve got it" text)
+    // Milestone Check - searching for your "Weve got it" phrase
     if (text.includes("delivered on") || text.includes("delivered to") || text.includes("has been delivered")) {
       currentStatus = 'DELIVERED';
     } else if (text.includes("out for delivery") || text.includes("due to be delivered today")) {
