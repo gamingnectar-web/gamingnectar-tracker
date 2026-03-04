@@ -7,7 +7,14 @@ app.use(cors({ origin: '*' }));
 
 app.get('/api/track', async (req, res) => {
   const trackingNumber = req.query.number;
+  
+  // 💓 HEARTBEAT CHECK: If it's just a ping to stay awake, stop here and save credits!
+  if (trackingNumber === 'KEEP_ALIVE') {
+    return res.json({ status: 'AWAKE', message: 'Heartbeat received' });
+  }
+
   if (!trackingNumber) return res.status(400).json({ error: 'Missing tracking number' });
+  
 
   console.log(`🤖 Force-Submit Strategy for: ${trackingNumber}`);
 
