@@ -9,7 +9,7 @@ app.get('/api/track', async (req, res) => {
   const trackingNumber = req.query.number;
   if (!trackingNumber) return res.status(400).json({ error: 'Missing tracking number' });
 
-  console.log(`🤖 Starting Bulletproof Emulator for: ${trackingNumber}`);
+  console.log(`🤖 Targeting Royal Mail with Cookie-Bypass for: ${trackingNumber}`);
 
   let browser;
   try {
@@ -18,27 +18,38 @@ app.get('/api/track', async (req, res) => {
     });
     
     const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 800 });
+    await page.setViewport({ width: 1280, height: 1000 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
 
-    // 1. Go to the search page directly
-    await page.goto('https://www.royalmail.com/track-your-item#/', { waitUntil: 'networkidle2', timeout: 30000 });
+    const url = `https://www.royalmail.com/track-your-item#/tracking-results/${trackingNumber}`;
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
 
-    // 2. Wait for ANY input field to appear and type the number
-    await page.waitForSelector('input', { timeout: 15000 });
-    await page.type('input', trackingNumber, { delay: 150 });
+    // 🛑 STEP 1: Click the "Accept All" Cookie Button
+    try {
+      await page.waitForSelector('#truste-consent-button', { timeout: 8000 });
+      await page.click('#truste-consent-button');
+      console.log("✅ Cookie banner dismissed.");
+      // Short pause to let the banner animation finish
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    } catch (e) {
+      console.log("⚠️ Cookie banner didn't appear or was already gone.");
+    }
 
-    // 3. Press "Enter" instead of clicking a specific button (more reliable)
-    await page.keyboard.press('Enter');
+    // 🛑 STEP 2: Wait for the Status Description to appear
+    try {
+      await page.waitForSelector('.status-description', { timeout: 10000 });
+      console.log("✅ Status info found on page.");
+    } catch (e) {
+      console.log("⚠️ Could not find .status-description selector.");
+    }
 
-    // 4. Wait for the URL to change or content to load
-    await new Promise(resolve => setTimeout(resolve, 6000));
-    
     const pageText = await page.evaluate(() => document.body.innerText);
+    await browser.close();
+
     const text = pageText.toLowerCase().replace(/['’]/g, "");
     let currentStatus = 'UNKNOWN';
 
-    // Milestone Check
+    // Milestone Check (includes your specific "weve got it" text)
     if (text.includes("delivered on") || text.includes("delivered to") || text.includes("has been delivered")) {
       currentStatus = 'DELIVERED';
     } else if (text.includes("out for delivery") || text.includes("due to be delivered today")) {
@@ -50,11 +61,11 @@ app.get('/api/track', async (req, res) => {
     res.json({ 
       tracking: trackingNumber, 
       status: currentStatus,
-      debug_text: pageText.substring(0, 1500) 
+      debug_text: pageText.substring(0, 3000) 
     });
 
   } catch (error) {
-    console.error("Scrape Error Detail:", error.message);
+    console.error("Scrape Error:", error.message);
     res.status(500).json({ error: 'Failed to scrape Royal Mail', detail: error.message });
   } finally {
     if (browser) await browser.close();
@@ -62,4 +73,4 @@ app.get('/api/track', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Bulletproof API live on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Final API live on port ${PORT}`));
