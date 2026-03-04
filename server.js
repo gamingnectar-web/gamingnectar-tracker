@@ -7,67 +7,65 @@ app.use(cors({ origin: '*' }));
 app.get('/api/track', async (req, res) => {
   const trackingNumber = String(req.query.number || '').trim();
   
-  // 💓 HEARTBEAT: Still here to keep Render awake!
+  // 💓 HEARTBEAT: Keeps Render awake
   if (trackingNumber === 'KEEP_ALIVE') return res.json({ status: 'AWAKE' });
   if (!trackingNumber) return res.status(400).json({ error: 'Missing tracking number' });
 
   try {
-    // We will set this secret key in Render in the next step
     const apiKey = process.env.TRACKINGMORE_API_KEY;
+    
+    if (!apiKey) {
+      return res.status(500).json({ error: 'API key missing from Render environment' });
+    }
 
-    // 1. Try to GET the tracking data if it already exists in your TrackingMore account
-    let getResponse = await fetch(`https://api.trackingmore.com/v4/trackings?tracking_numbers=${trackingNumber}`, {
+    // 1. Try to GET the tracking data if it already exists
+    let getResponse = await fetch(`https://api.trackingmore.com/v4/trackings/get?tracking_numbers=${trackingNumber}`, {
       method: 'GET',
-      headers: { 'Tracking-Api-Key': apiKey, 'Content-Type': 'application/json' }
+      headers: {
+        'Tracking-Api-Key': apiKey,
+        'Content-Type': 'application/json'
+      }
     });
     
-    let getData = await getResponse.json();
-    let trackingData = getData.data && getData.data.length > 0 ? getData.data[0] : null;
-
-    // 2. If it doesn't exist yet, CREATE it (TrackingMore fetches live data upon creation)
-    if (!trackingData) {
-      let createResponse = await fetch('https://api.trackingmore.com/v4/trackings/create', {
-        method: 'POST',
-        headers: { 'Tracking-Api-Key': apiKey, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tracking_number: trackingNumber, courier_code: "royal-mail" })
-      });
-      let createData = await createResponse.json();
-      
-      if (createData.meta.code === 200) {
-        trackingData = createData.data;
-      } else if (createData.meta.code === 4101) {
-        // 4101 means it already exists, fallback to transit
-         trackingData = { delivery_status: 'transit' }; 
-      } else {
-         return res.status(400).json({ error: 'TrackingMore API Error', details: createData.meta.message });
-      }
+    let data = await getResponse.json();
+    
+    // 2. If it doesn't exist in your account yet, CREATE it
+    if (!data.data || data.data.length === 0) {
+        let createResponse = await fetch('https://api.trackingmore.com/v4/trackings/create', {
+          method: 'POST',
+          headers: {
+            'Tracking-Api-Key': apiKey,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ tracking_number: trackingNumber, courier_code: "royal-mail" })
+        });
+        data = await createResponse.json();
     }
 
-    // 3. Map TrackingMore's official status to your custom Shopify Hub status
+    // 3. Extract TrackingMore's status
+    let tmStatus = 'pending';
+    if (data.data && Array.isArray(data.data) && data.data.length > 0) {
+        tmStatus = data.data[0].delivery_status;
+    } else if (data.data && data.data.delivery_status) {
+        tmStatus = data.data.delivery_status;
+    }
+
+    // 4. Map it to your custom Shopify Hub status
     let currentStatus = 'UNKNOWN';
-    const tmStatus = trackingData.delivery_status;
+    if (tmStatus === 'delivered') currentStatus = 'DELIVERED';
+    else if (tmStatus === 'pickup' || tmStatus === 'outfordelivery') currentStatus = 'OUT_FOR_DELIVERY';
+    else if (tmStatus === 'transit') currentStatus = 'WITH_COURIER';
+    else if (tmStatus === 'notfound') currentStatus = 'NOT_FOUND';
 
-    // TrackingMore uses 'pickup' to mean 'Out for Delivery' and 'transit' for 'With Courier'
-    if (tmStatus === 'delivered') {
-      currentStatus = 'DELIVERED';
-    } else if (tmStatus === 'pickup' || tmStatus === 'outfordelivery') {
-      currentStatus = 'OUT_FOR_DELIVERY';
-    } else if (tmStatus === 'transit') {
-      currentStatus = 'WITH_COURIER';
-    } else if (tmStatus === 'notfound') {
-      currentStatus = 'NOT_FOUND';
-    }
-
-    // 4. Send the clean data to your Shopify store instantly
+    // 5. Send it back to Shopify instantly
     return res.json({
       tracking: trackingNumber,
       status: currentStatus,
-      raw_status: tmStatus // Included for debugging
+      raw_status: tmStatus
     });
 
   } catch (error) {
-    console.error("API Error:", error.message);
-    return res.status(500).json({ error: 'Failed to communicate with TrackingMore' });
+    return res.status(500).json({ error: 'API Error', details: error.message });
   }
 });
 
