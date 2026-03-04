@@ -6,95 +6,135 @@ const app = express();
 app.use(cors({ origin: '*' }));
 
 function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-function classifyFromText(rawText) {
-  const text = (rawText || '').toLowerCase().replace(/['’]/g, '');
-
-  if (
-    text.includes('not recognised') ||
-    text.includes('not recognized') ||
-    text.includes("we can't confirm") ||
-    text.includes('we cant confirm')
-  ) return 'NOT_FOUND';
-
-  if (text.includes('out for delivery') || text.includes('due to be delivered today')) return 'OUT_FOR_DELIVERY';
-
-  if (text.includes('delivered on') || text.includes('delivered to')) return 'DELIVERED';
-
-  if (text.includes("we've got it") || text.includes('weve got it') || text.includes('item received') || text.includes('warrington mc'))
-    return 'WITH_COURIER';
-
-  return 'UNKNOWN';
+function safeJsonStringify(obj) {
+  try { return JSON.stringify(obj); } catch { return ''; }
 }
 
-// Heuristic: find a likely tracking JSON response among all captured JSON responses
-function pickBestTrackingJson(jsonResponses) {
-  // Prefer JSON objects with "events"/"event"/"tracking"/"items"/"shipments" etc.
-  const score = (obj) => {
-    if (!obj || typeof obj !== 'object') return 0;
-    const keys = Object.keys(obj).map(k => k.toLowerCase());
-    let s = 0;
-
-    const bump = (k, w) => { if (keys.includes(k)) s += w; };
-
-    bump('events', 8);
-    bump('event', 6);
-    bump('tracking', 8);
-    bump('track', 6);
-    bump('items', 6);
-    bump('item', 4);
-    bump('shipments', 6);
-    bump('shipment', 5);
-    bump('summary', 5);
-    bump('status', 4);
-    bump('delivery', 4);
-    bump('milestones', 6);
-    bump('scans', 6);
-    bump('history', 6);
-
-    // Also bump if any nested arrays look like events
-    try {
-      const str = JSON.stringify(obj).toLowerCase();
-      if (str.includes('delivered')) s += 4;
-      if (str.includes('out for delivery')) s += 4;
-      if (str.includes("we've got it") || str.includes('weve got it')) s += 3;
-      if (str.includes('warrington')) s += 2;
-    } catch {}
-
-    return s;
+function deepScan(obj) {
+  // Collect some signals from an unknown JSON schema
+  const out = {
+    hasEventsArray: false,
+    hasHistory: false,
+    hasMilestones: false,
+    hasStatusKey: false,
+    stringHits: {
+      delivered: 0,
+      outForDelivery: 0,
+      gotIt: 0,
+      notRecognised: 0
+    }
   };
 
-  let best = null;
-  let bestScore = -1;
+  const seen = new Set();
+  const stack = [obj];
 
-  for (const r of jsonResponses) {
-    const s = score(r.json);
-    if (s > bestScore) {
-      best = r;
-      bestScore = s;
+  while (stack.length) {
+    const cur = stack.pop();
+    if (!cur || typeof cur !== 'object') continue;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+
+    if (Array.isArray(cur)) {
+      // Heuristic: arrays of objects that include date/time/location/status often represent events
+      if (cur.length && cur.some(x => x && typeof x === 'object')) {
+        // weak signal, refined by key checks below
+      }
+      for (const v of cur) stack.push(v);
+      continue;
+    }
+
+    for (const [k, v] of Object.entries(cur)) {
+      const lk = String(k).toLowerCase();
+
+      if (lk === 'events' && Array.isArray(v)) out.hasEventsArray = true;
+      if (lk.includes('event') && Array.isArray(v)) out.hasEventsArray = true;
+      if (lk.includes('history')) out.hasHistory = true;
+      if (lk.includes('milestone')) out.hasMilestones = true;
+      if (lk === 'status' || lk.includes('currentstatus') || lk.includes('trackingstatus')) out.hasStatusKey = true;
+
+      if (typeof v === 'string') {
+        const t = v.toLowerCase().replace(/['’]/g, '');
+        if (t.includes('delivered')) out.stringHits.delivered++;
+        if (t.includes('out for delivery') || t.includes('due to be delivered today')) out.stringHits.outForDelivery++;
+        if (t.includes("weve got it") || t.includes("we've got it") || t.includes('item received')) out.stringHits.gotIt++;
+        if (t.includes('not recognised') || t.includes('not recognized') || t.includes("we can't confirm") || t.includes('we cant confirm')) out.stringHits.notRecognised++;
+      } else if (v && typeof v === 'object') {
+        stack.push(v);
+      }
     }
   }
-  return best;
+
+  return out;
 }
 
-function classifyFromJson(obj) {
-  // We don’t know the exact schema, so we use flexible string searching.
-  // Once you see the real payload, you can tighten this to exact fields.
-  const str = JSON.stringify(obj || {}).toLowerCase().replace(/['’]/g, '');
+function classifyFromTrackingPayload(payload) {
+  // Use both deep scan + global string scan
+  const raw = safeJsonStringify(payload).toLowerCase().replace(/['’]/g, '');
 
-  if (str.includes('not recognised') || str.includes('not recognized') || str.includes("we cant confirm") || str.includes("we can't confirm"))
-    return 'NOT_FOUND';
+  // Explicit failure
+  if (
+    raw.includes('not recognised') ||
+    raw.includes('not recognized') ||
+    raw.includes("we cant confirm") ||
+    raw.includes("we can't confirm")
+  ) return 'NOT_FOUND';
 
-  if (str.includes('out for delivery') || str.includes('due to be delivered today')) return 'OUT_FOR_DELIVERY';
-
-  if (str.includes('delivered on') || str.includes('delivered to') || str.includes('"delivered"')) return 'DELIVERED';
-
-  if (str.includes("weve got it") || str.includes("we've got it") || str.includes('item received') || str.includes('warrington mc'))
+  // Strong positives
+  if (raw.includes('out for delivery') || raw.includes('due to be delivered today')) return 'OUT_FOR_DELIVERY';
+  if (raw.includes('delivered on') || raw.includes('delivered to') || raw.includes('"delivered"')) return 'DELIVERED';
+  if (raw.includes("weve got it") || raw.includes("we've got it") || raw.includes('item received') || raw.includes('warrington mc'))
     return 'WITH_COURIER';
 
+  // Fallback to deep scan signals if wording varies
+  const scan = deepScan(payload);
+  if (scan.stringHits.delivered > 0) return 'DELIVERED';
+  if (scan.stringHits.outForDelivery > 0) return 'OUT_FOR_DELIVERY';
+  if (scan.stringHits.gotIt > 0) return 'WITH_COURIER';
+  if (scan.stringHits.notRecognised > 0) return 'NOT_FOUND';
+
   return 'UNKNOWN';
+}
+
+function scoreJsonCandidate({ json, url }, trackingNumber) {
+  const topKeys = json && typeof json === 'object' ? Object.keys(json) : [];
+  const raw = safeJsonStringify(json).toLowerCase();
+  const tn = trackingNumber.toLowerCase();
+
+  const scan = deepScan(json);
+
+  let score = 0;
+
+  // Biggest signal: payload contains the tracking number
+  if (raw.includes(tn)) score += 50;
+
+  // Prefer payloads that look like actual tracking content (events/milestones/history)
+  if (scan.hasEventsArray) score += 25;
+  if (scan.hasHistory) score += 15;
+  if (scan.hasMilestones) score += 15;
+  if (scan.hasStatusKey) score += 10;
+
+  // De-prioritize obvious config blobs
+  const lowerKeys = topKeys.map(k => k.toLowerCase());
+  const looksLikeConfigOnly =
+    lowerKeys.length <= 4 &&
+    lowerKeys.includes('appconfig') &&
+    lowerKeys.includes('apptext');
+
+  if (looksLikeConfigOnly) score -= 40;
+
+  // Small bump for “signal words” but not too much (config can contain them)
+  score += Math.min(10, scan.stringHits.delivered);
+  score += Math.min(10, scan.stringHits.outForDelivery);
+  score += Math.min(6, scan.stringHits.gotIt);
+  score += Math.min(6, scan.stringHits.notRecognised);
+
+  // Prefer the known Royal Mail JSON endpoint slightly, but not if it’s config-only
+  if (url.includes('/spalp/rml_track_and_trace/json')) score += 5;
+
+  return { score, scan, topKeys };
 }
 
 app.get('/api/track', async (req, res) => {
@@ -119,22 +159,18 @@ app.get('/api/track', async (req, res) => {
     );
     await page.setExtraHTTPHeaders({ 'accept-language': 'en-GB,en;q=0.9' });
 
-    // Capture candidate JSON responses
+    // Capture JSON responses
     const jsonResponses = [];
     page.on('response', async (resp) => {
       try {
-        const url = resp.url();
         const ct = (resp.headers()['content-type'] || '').toLowerCase();
+        if (!ct.includes('json')) return;
 
-        // Only look at likely XHR/fetch JSON-ish responses
-        if (!ct.includes('application/json') && !ct.includes('json')) return;
-
-        // Avoid gigantic irrelevant blobs (still allow if it’s JSON)
         const json = await resp.json().catch(() => null);
         if (!json) return;
 
         jsonResponses.push({
-          url,
+          url: resp.url(),
           status: resp.status(),
           contentType: ct,
           json,
@@ -148,7 +184,7 @@ app.get('/api/track', async (req, res) => {
     logs.push(`🌐 Loading: ${baseUrl}`);
     await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-    // ---- Cookies best-effort
+    // Cookies (best effort)
     logs.push('🍪 Handling cookie banner...');
     try {
       const clicked = await page.evaluate(() => {
@@ -157,24 +193,20 @@ app.get('/api/track', async (req, res) => {
           document.querySelector('#truste-consent-button') ||
           document.querySelector('button#onetrust-accept-btn-handler') ||
           btns.find(b => /accept all/i.test((b.innerText || '').trim()));
-        if (accept) {
-          accept.click();
-          return true;
-        }
+        if (accept) { accept.click(); return true; }
         return false;
       });
-
       if (clicked) {
         logs.push('✅ Cookie accept clicked.');
         await sleep(800);
       } else {
         logs.push('ℹ️ Cookie banner not found / not needed.');
       }
-    } catch (e) {
+    } catch {
       logs.push('ℹ️ Cookie handling skipped (non-fatal).');
     }
 
-    // ---- Fill input + click Track
+    // Fill input + click
     logs.push('⌨️ Setting tracking number in #barcode-input...');
     await page.waitForSelector('#barcode-input', { timeout: 15000 });
 
@@ -183,6 +215,7 @@ app.get('/api/track', async (req, res) => {
       el.value = value;
       el.dispatchEvent(new Event('input', { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
+      el.dispatchEvent(new Event('blur', { bubbles: true }));
     }, trackingNumber);
 
     const inputVal = await page.$eval('#barcode-input', el => el.value);
@@ -196,64 +229,54 @@ app.get('/api/track', async (req, res) => {
       if (b) { b.click(); return true; }
       return false;
     });
-
     if (!clickedTrack) throw new Error('Submit button not found');
 
-    // ---- Wait for either:
-    // 1) a promising JSON response, OR
-    // 2) results-like text to appear
-    logs.push('⏳ Waiting for tracking data (JSON or results text)...');
-
+    // Wait a bit for JSON calls to complete
+    logs.push('⏳ Waiting for JSON responses...');
     const start = Date.now();
-    let sawJson = false;
-
-    while (Date.now() - start < 25000) {
-      // If any JSON responses have arrived, we can stop early
-      if (jsonResponses.length > 0) {
-        sawJson = true;
-        break;
-      }
-
-      // Otherwise check if page text looks like results
-      const looksLikeResults = await page.evaluate(() => {
-        const t = (document.body?.innerText || '').toLowerCase();
-        return t.includes('delivered') ||
-               t.includes('out for delivery') ||
-               t.includes("we've got it") ||
-               t.includes('weve got it') ||
-               t.includes('item received') ||
-               t.includes('tracking update') ||
-               t.includes('not recognised') ||
-               t.includes('not recognized') ||
-               t.includes("we can't confirm") ||
-               t.includes('we cant confirm');
-      });
-
-      if (looksLikeResults) break;
-      await sleep(400);
+    while (Date.now() - start < 20000) {
+      if (jsonResponses.length >= 2) break; // usually enough to score
+      await sleep(300);
     }
+    logs.push(`✅ Captured ${jsonResponses.length} JSON response(s).`);
 
-    if (sawJson) logs.push(`✅ Captured ${jsonResponses.length} JSON response(s).`);
-    else logs.push('ℹ️ No JSON captured in time; will fall back to text scrape.');
-
-    // ---- Decide status
-    let currentStatus = 'UNKNOWN';
-    let bestJson = null;
+    // Pick best candidate based on trackingNumber + schema signals
+    let best = null;
+    let bestMeta = null;
+    const candidates = jsonResponses.map(r => {
+      const meta = scoreJsonCandidate(r, trackingNumber);
+      return {
+        url: r.url,
+        http_status: r.status,
+        top_keys: meta.topKeys.slice(0, 25),
+        score: meta.score,
+        signals: meta.scan,
+      };
+    }).sort((a, b) => b.score - a.score);
 
     if (jsonResponses.length) {
-      bestJson = pickBestTrackingJson(jsonResponses);
-      if (bestJson) {
-        currentStatus = classifyFromJson(bestJson.json);
-        logs.push(`🧩 Best JSON URL: ${bestJson.url}`);
-      }
+      const top = candidates[0];
+      best = jsonResponses.find(r => r.url === top.url) || null;
+      bestMeta = top || null;
     }
 
-    // Fallback to text if still unknown or no json
-    const pageText = await page.evaluate(() => document.body?.innerText || '');
-    if (!jsonResponses.length || currentStatus === 'UNKNOWN') {
-      const fromText = classifyFromText(pageText);
-      if (fromText !== 'UNKNOWN') currentStatus = fromText;
+    let currentStatus = 'UNKNOWN';
+    let trackingPayloadUsed = false;
+
+    if (best && bestMeta && bestMeta.score >= 20) {
+      // Only trust it if it scores well enough (avoids config-only false positives)
+      currentStatus = classifyFromTrackingPayload(best.json);
+      trackingPayloadUsed = true;
+      logs.push(`🧩 Using JSON candidate: ${best.url}`);
+      logs.push(`🧠 Candidate score: ${bestMeta.score}`);
+    } else {
+      logs.push('⚠️ No high-confidence tracking JSON found; falling back to page text (less reliable).');
+      const pageText = await page.evaluate(() => document.body?.innerText || '');
+      currentStatus = (pageText ? 'UNKNOWN' : 'UNKNOWN'); // keep unknown; you can add a text classifier if you want
     }
+
+    // Include some UI text for debugging, but don’t use it as primary truth
+    const pageText = await page.evaluate(() => document.body?.innerText || '');
 
     logs.push(`🏁 Final Status: ${currentStatus}`);
 
@@ -265,10 +288,11 @@ app.get('/api/track', async (req, res) => {
       logs,
       debug: {
         json_count: jsonResponses.length,
-        best_json_url: bestJson?.url || null,
-        best_json_top_keys: bestJson?.json && typeof bestJson.json === 'object'
-          ? Object.keys(bestJson.json).slice(0, 25)
-          : null,
+        used_tracking_payload: trackingPayloadUsed,
+        best_json_url: best?.url || null,
+        best_score: bestMeta?.score ?? null,
+        best_json_top_keys: bestMeta?.top_keys || null,
+        candidates: candidates.slice(0, 7), // top 7 for inspection
       },
       debug_text: pageText.substring(0, 2000),
     });
