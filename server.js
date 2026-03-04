@@ -24,56 +24,54 @@ app.get('/api/track', async (req, res) => {
     await page.setViewport({ width: 1280, height: 1200 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
 
-    // 1. Initial Landing
-    logs.push("🌐 Navigating to Royal Mail Landing...");
+    logs.push("🌐 Landing on Royal Mail...");
     await page.goto('https://www.royalmail.com/track-your-item#/', { waitUntil: 'networkidle2', timeout: 30000 });
 
-    // 2. Cookie Stage
+    // --- STAGE 1: THE COOKIE BOUNCER ---
     try {
-      logs.push("🍪 Clearing cookie banner...");
       await page.waitForSelector('#truste-consent-button', { timeout: 5000 });
       await page.click('#truste-consent-button');
-      logs.push("✅ Cookies accepted.");
-      // Small pause to let the overlay disappear
-      await new Promise(r => setTimeout(r, 1500)); 
+      logs.push("✅ Cookies cleared.");
+      await new Promise(r => setTimeout(r, 2000)); 
+    } catch (e) { logs.push("ℹ️ Cookie banner skipped."); }
+
+    // --- STAGE 2: HUMAN EMULATION INPUT ---
+    logs.push("⌨️ Finding and typing into #barcode-input...");
+    try {
+      await page.waitForSelector('#barcode-input', { timeout: 10000 });
+      await page.focus('#barcode-input');
+      // Type with a slight delay to trigger site's internal validation
+      await page.type('#barcode-input', trackingNumber, { delay: 150 });
+      logs.push("✅ Typing complete.");
+      
+      // Pressing 'Enter' is often more reliable than clicking the button
+      logs.push("🖱️ Submitting form via Enter key...");
+      await page.keyboard.press('Enter');
     } catch (e) {
-      logs.push("ℹ️ Cookie banner skipped.");
+      logs.push("❌ FAILED: Input box not found.");
+      throw new Error("UI Blocked");
     }
 
-    // 3. Redirection Stage
-    logs.push(`⚡ Jumping to Results URL: .../${trackingNumber}`);
-    const resultsUrl = `https://www.royalmail.com/track-your-item#/tracking-results/${trackingNumber}`;
-    await page.goto(resultsUrl, { waitUntil: 'networkidle2', timeout: 30000 });
-
-    // 4. VERIFICATION STAGE: Check if results container exists
-    logs.push("🔍 Verifying page transition...");
-    const hasResultsContainer = await page.evaluate(() => {
-      return !!document.querySelector('.status-description') || !!document.querySelector('.tracking-history');
-    });
-
-    if (hasResultsContainer) {
-      logs.push("✅ VERIFIED: Landing on results page detected.");
-    } else {
-      logs.push("⚠️ WARNING: Results container not found. Page might be stuck or blocked.");
-      // Fallback: If not found, try typing it manually just once
-      logs.push("⌨️ Attempting manual input fallback...");
-      try {
-        await page.waitForSelector('#barcode-input', { timeout: 5000 });
-        await page.type('#barcode-input', trackingNumber);
-        await page.click('#submit');
-        logs.push("✅ Fallback submit clicked.");
-        await new Promise(r => setTimeout(r, 5000));
-      } catch(err) {
-        logs.push("❌ Fallback input also failed.");
-      }
+    // --- STAGE 3: THE WAIT FOR DATA ---
+    logs.push("⏳ Waiting for page to transition to results...");
+    try {
+      // We wait for the URL to contain 'tracking-results'
+      await page.waitForFunction(
+        (num) => window.location.href.includes(num) || document.body.innerText.includes('got it'),
+        { timeout: 15000 },
+        trackingNumber
+      );
+      logs.push("✅ Transition detected!");
+    } catch (e) {
+      logs.push("⚠️ Timeout waiting for transition. Checking whatever text we have...");
     }
 
-    // 5. Final Extraction
+    await new Promise(r => setTimeout(r, 2000));
     const pageText = await page.evaluate(() => document.body.innerText);
     const text = pageText.toLowerCase().replace(/['’]/g, "");
     let currentStatus = 'UNKNOWN';
 
-    // Keywords from your screenshot
+    // Milestone Match
     if (text.includes("delivered on") || text.includes("delivered to")) {
       currentStatus = 'DELIVERED';
     } else if (text.includes("out for delivery") || text.includes("due to be delivered today")) {
