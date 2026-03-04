@@ -17,30 +17,33 @@ app.get('/api/track', async (req, res) => {
     });
     
     const page = await browser.newPage();
-    const url = `https://www.royalmail.com/track-your-item#/tracking-results/${trackingNumber}`;
+    // Use a desktop-like user agent to avoid mobile-specific cookie popups
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36');
     
+    const url = `https://www.royalmail.com/track-your-item#/tracking-results/${trackingNumber}`;
     await page.goto(url, { waitUntil: 'networkidle2' });
     
-    // 🛑 X-RAY VISION FIX: Wait specifically for the tracking info to load behind the banner
+    // 🛑 X-RAY FIX: Wait specifically for the results to load behind the cookie banner
     try {
       await page.waitForFunction(
         () => document.body.innerText.includes('Tracking number'),
-        { timeout: 10000 }
+        { timeout: 15000 }
       );
     } catch (e) {
-      console.log("Timeout waiting for 'Tracking number' text. Page might be slow.");
+      console.log("Timed out waiting for content. Status might still be loading.");
     }
 
-    // Give it 1 extra second just to be safe
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    // Give it 2 extra seconds for the status text to fully animate in
+    await new Promise(resolve => setTimeout(resolve, 2000));
     
     const pageText = await page.evaluate(() => document.body.innerText);
     await browser.close();
 
+    // Strip apostrophes and prep text
     const text = pageText.toLowerCase().replace(/['’]/g, "");
     let currentStatus = 'UNKNOWN';
 
-    // Improved keyword detection
+    // Search for milestones
     if (text.includes("delivered on") || text.includes("delivered to") || text.includes("has been delivered")) {
       currentStatus = 'DELIVERED';
     } else if (text.includes("out for delivery") || text.includes("due to be delivered today")) {
@@ -52,8 +55,8 @@ app.get('/api/track', async (req, res) => {
     res.json({ 
       tracking: trackingNumber, 
       status: currentStatus,
-      // Increased to 1000 characters so we can see past the cookie banner in logs
-      debug_text: pageText.substring(0, 1000) 
+      // Increased to 4000 so we can definitely see the status in our debug window
+      debug_text: pageText.substring(0, 4000) 
     });
 
   } catch (error) {
