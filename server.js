@@ -3,45 +3,90 @@ const cors = require('cors');
 
 const app = express();
 app.use(cors({ origin: '*' }));
+app.use(express.json()); // Allows Render to parse Shopify's JSON webhooks
 
+// ==========================================
+// 1. SHOPIFY WEBHOOK LISTENER (Triggered on Fulfillment)
+// ==========================================
+app.post('/api/shopify-webhook', async (req, res) => {
+  // Always reply to Shopify immediately so they know we got it
+  res.status(200).send('Webhook received');
+
+  try {
+    const fulfillment = req.body;
+    
+    // Check if there is actually a tracking number attached
+    if (!fulfillment.tracking_numbers || fulfillment.tracking_numbers.length === 0) {
+      return console.log("Webhook ignored: No tracking numbers found.");
+    }
+    
+    const trackingNumber = fulfillment.tracking_numbers[0];
+    const company = String(fulfillment.tracking_company || '').toLowerCase();
+
+    // Map the Shopify courier name to TrackingMore's official courier code
+    let courierCode = null;
+    if (company.includes('royal mail')) courierCode = 'royal-mail';
+    else if (company.includes('evri') || company.includes('hermes')) courierCode = 'evri';
+    else if (company.includes('dpd')) courierCode = 'dpd-uk';
+    else if (company.includes('dhl')) courierCode = 'dhl';
+
+    if (!courierCode) {
+      return console.log(`Webhook ignored: Courier '${company}' not currently mapped.`);
+    }
+
+    const apiKey = process.env.TRACKINGMORE_API_KEY;
+    if (!apiKey) return console.error("Webhook failed: Missing API Key");
+
+    // Register the shipment with TrackingMore instantly
+    let createResponse = await fetch('https://api.trackingmore.com/v4/trackings/create', {
+      method: 'POST',
+      headers: {
+        'Tracking-Api-Key': apiKey,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ tracking_number: trackingNumber, courier_code: courierCode })
+    });
+
+    let createData = await createResponse.json();
+    console.log(`✅ Webhook Success: Registered ${trackingNumber} (${courierCode}) with TrackingMore!`);
+
+  } catch (error) {
+    console.error('🚨 Webhook processing error:', error.message);
+  }
+});
+
+// ==========================================
+// 2. CUSTOMER HUB TRACKING ROUTE (Triggered by Customer)
+// ==========================================
 app.get('/api/track', async (req, res) => {
   const trackingNumber = String(req.query.number || '').trim();
   
-  // Heartbeat to keep Render awake
   if (trackingNumber === 'KEEP_ALIVE') return res.json({ status: 'AWAKE' });
   if (!trackingNumber) return res.status(400).json({ error: 'Missing tracking number' });
 
   try {
     const apiKey = process.env.TRACKINGMORE_API_KEY;
-    if (!apiKey) {
-      return res.status(500).json({ error: 'API key missing from Render environment' });
-    }
+    if (!apiKey) return res.status(500).json({ error: 'API key missing from Render environment' });
 
-    // 1. Try to GET the tracking data
+    // Try to GET the tracking data
     let getResponse = await fetch(`https://api.trackingmore.com/v4/trackings/get?tracking_numbers=${trackingNumber}`, {
       method: 'GET',
-      headers: {
-        'Tracking-Api-Key': apiKey,
-        'Content-Type': 'application/json'
-      }
+      headers: { 'Tracking-Api-Key': apiKey, 'Content-Type': 'application/json' }
     });
     
     let data = await getResponse.json();
     
-    // 2. If it doesn't exist, CREATE it
+    // If it doesn't exist (e.g. webhook failed or missed), CREATE it as a fallback
     if (!data.data || data.data.length === 0) {
         let createResponse = await fetch('https://api.trackingmore.com/v4/trackings/create', {
           method: 'POST',
-          headers: {
-            'Tracking-Api-Key': apiKey,
-            'Content-Type': 'application/json'
-          },
+          headers: { 'Tracking-Api-Key': apiKey, 'Content-Type': 'application/json' },
           body: JSON.stringify({ tracking_number: trackingNumber, courier_code: "royal-mail" })
         });
         data = await createResponse.json();
     }
 
-    // 3. Extract Status AND Smart History Timeline
+    // Extract Status AND Smart History Timeline
     let tmStatus = 'pending';
     let trackHistory = [];
 
@@ -64,21 +109,21 @@ app.get('/api/track', async (req, res) => {
         }
     }
 
-    // 4. Clean up the history array for Shopify
+    // Clean up the history array for Shopify
     const formattedHistory = trackHistory.map(event => ({
       date: event.checkpoint_date || event.Date || '', 
       detail: event.tracking_detail || event.StatusDescription || 'Update received',
       location: event.location || event.Details || ''
     }));
 
-    // 5. Map to your custom Hub status
+    // Map to your custom Hub status
     let currentStatus = 'UNKNOWN';
     if (tmStatus === 'delivered') currentStatus = 'DELIVERED';
     else if (tmStatus === 'pickup' || tmStatus === 'outfordelivery') currentStatus = 'OUT_FOR_DELIVERY';
     else if (tmStatus === 'transit') currentStatus = 'WITH_COURIER';
     else if (tmStatus === 'notfound') currentStatus = 'NOT_FOUND';
 
-    // 6. Send it all back
+    // Send it all back to the Shopify frontend
     return res.json({
       tracking: trackingNumber,
       status: currentStatus,
