@@ -60,9 +60,16 @@ app.post('/api/shopify-webhook', async (req, res) => {
 // ==========================================
 app.get('/api/track', async (req, res) => {
   const trackingNumber = String(req.query.number || '').trim();
+  const rawCarrier = String(req.query.carrier || '').toLowerCase(); // Read the carrier from Shopify
   
   if (trackingNumber === 'KEEP_ALIVE') return res.json({ status: 'AWAKE' });
   if (!trackingNumber) return res.status(400).json({ error: 'Missing tracking number' });
+
+  // Map the Shopify carrier to TrackingMore's format for the frontend API check
+  let courierCode = 'royal-mail'; // Default fallback
+  if (rawCarrier.includes('evri') || rawCarrier.includes('hermes')) courierCode = 'evri';
+  else if (rawCarrier.includes('dpd')) courierCode = 'dpd-uk';
+  else if (rawCarrier.includes('dhl')) courierCode = 'dhl';
 
   try {
     const apiKey = process.env.TRACKINGMORE_API_KEY;
@@ -76,12 +83,12 @@ app.get('/api/track', async (req, res) => {
     
     let data = await getResponse.json();
     
-    // If it doesn't exist (e.g. webhook failed or missed), CREATE it as a fallback
+    // If it doesn't exist (e.g. webhook failed or missed), CREATE it as a fallback dynamically
     if (!data.data || data.data.length === 0) {
         let createResponse = await fetch('https://api.trackingmore.com/v4/trackings/create', {
           method: 'POST',
           headers: { 'Tracking-Api-Key': apiKey, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ tracking_number: trackingNumber, courier_code: "royal-mail" })
+          body: JSON.stringify({ tracking_number: trackingNumber, courier_code: courierCode })
         });
         data = await createResponse.json();
     }
