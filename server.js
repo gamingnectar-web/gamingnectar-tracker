@@ -45,7 +45,6 @@ app.get('/api/track', async (req, res) => {
     let tmStatus = 'pending';
     let trackHistory = [];
 
-    // TrackingMore sometimes wraps the object in an array, sometimes not.
     const item = (data.data && Array.isArray(data.data)) ? data.data[0] : data.data;
 
     if (item) {
@@ -67,7 +66,6 @@ app.get('/api/track', async (req, res) => {
 
     // 4. Clean up the history array for Shopify
     const formattedHistory = trackHistory.map(event => ({
-      // TrackingMore uses different casing depending on the raw courier API response
       date: event.checkpoint_date || event.Date || '', 
       detail: event.tracking_detail || event.StatusDescription || 'Update received',
       location: event.location || event.Details || ''
@@ -85,7 +83,7 @@ app.get('/api/track', async (req, res) => {
       tracking: trackingNumber,
       status: currentStatus,
       raw_status: tmStatus,
-      history: formattedHistory // The new, much smarter timeline data!
+      history: formattedHistory
     });
 
   } catch (error) {
