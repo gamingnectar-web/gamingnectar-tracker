@@ -6,7 +6,39 @@ app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // ==========================================
-// 1. TRACKING ROUTE (CUSTOMER HUB)
+// 1. SHOPIFY WEBHOOK LISTENER
+// ==========================================
+app.post('/api/shopify-webhook', async (req, res) => {
+  res.status(200).send('Webhook received');
+  try {
+    const fulfillment = req.body;
+    if (!fulfillment.tracking_numbers || fulfillment.tracking_numbers.length === 0) return;
+    
+    const trackingNumber = fulfillment.tracking_numbers[0];
+    const company = String(fulfillment.tracking_company || '').toLowerCase();
+
+    let courierCode = null;
+    if (company.includes('royal mail')) courierCode = 'royal-mail';
+    else if (company.includes('evri') || company.includes('hermes')) courierCode = 'evri';
+    else if (company.includes('dpd')) courierCode = 'dpd-uk';
+    else if (company.includes('dhl')) courierCode = 'dhl';
+
+    if (!courierCode) return;
+
+    const apiKey = process.env.TRACKINGMORE_API_KEY;
+    await fetch('https://api.trackingmore.com/v4/trackings/create', {
+      method: 'POST',
+      headers: { 'Tracking-Api-Key': apiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tracking_number: trackingNumber, courier_code: courierCode })
+    });
+    console.log(`✅ Webhook: Registered ${trackingNumber}`);
+  } catch (error) {
+    console.error('🚨 Webhook error:', error.message);
+  }
+});
+
+// ==========================================
+// 2. RESTORED TRACKING ROUTE (Original Logic)
 // ==========================================
 app.get('/api/track', async (req, res) => {
   const trackingNumber = String(req.query.number || '').trim();
@@ -22,7 +54,7 @@ app.get('/api/track', async (req, res) => {
 
   try {
     const apiKey = process.env.TRACKINGMORE_API_KEY;
-    
+
     let getResponse = await fetch(`https://api.trackingmore.com/v4/trackings/get?tracking_numbers=${trackingNumber}`, {
       method: 'GET',
       headers: { 'Tracking-Api-Key': apiKey, 'Content-Type': 'application/json' }
@@ -30,17 +62,30 @@ app.get('/api/track', async (req, res) => {
     
     let data = await getResponse.json();
     
+    // Fallback: If not in TrackingMore, create it
     if (!data.data || data.data.length === 0) {
-        await fetch('https://api.trackingmore.com/v4/trackings/create', {
+        let createRes = await fetch('https://api.trackingmore.com/v4/trackings/create', {
           method: 'POST',
           headers: { 'Tracking-Api-Key': apiKey, 'Content-Type': 'application/json' },
           body: JSON.stringify({ tracking_number: trackingNumber, courier_code: courierCode })
         });
-        return res.json({ status: 'PROVISIONING', history: [] });
+        data = await createRes.json();
     }
 
-    const item = data.data[0];
-    const trackHistory = item.origin_info?.trackinfo || item.trackinfo || [];
+    let tmStatus = 'pending';
+    let trackHistory = [];
+    const item = (data.data && Array.isArray(data.data)) ? data.data[0] : data.data;
+
+    if (item) {
+        tmStatus = item.delivery_status || 'pending';
+        const originHistory = item.origin_info?.trackinfo || [];
+        const destHistory = item.destination_info?.trackinfo || [];
+        const rootHistory = item.trackinfo || [];
+
+        if (originHistory.length >= destHistory.length && originHistory.length >= rootHistory.length) trackHistory = originHistory;
+        else if (destHistory.length >= originHistory.length && destHistory.length >= rootHistory.length) trackHistory = destHistory;
+        else trackHistory = rootHistory;
+    }
 
     const formattedHistory = trackHistory.map(event => ({
       date: event.checkpoint_date || event.Date || '', 
@@ -49,19 +94,25 @@ app.get('/api/track', async (req, res) => {
     }));
 
     let currentStatus = 'UNKNOWN';
-    if (item.delivery_status === 'delivered') currentStatus = 'DELIVERED';
-    else if (['pickup', 'outfordelivery'].includes(item.delivery_status)) currentStatus = 'OUT_FOR_DELIVERY';
-    else if (item.delivery_status === 'transit') currentStatus = 'WITH_COURIER';
+    if (tmStatus === 'delivered') currentStatus = 'DELIVERED';
+    else if (tmStatus === 'pickup' || tmStatus === 'outfordelivery') currentStatus = 'OUT_FOR_DELIVERY';
+    else if (tmStatus === 'transit') currentStatus = 'WITH_COURIER';
+    else if (tmStatus === 'notfound') currentStatus = 'NOT_FOUND';
 
-    return res.json({ status: currentStatus, history: formattedHistory });
+    return res.json({
+      tracking: trackingNumber,
+      status: currentStatus,
+      raw_status: tmStatus,
+      history: formattedHistory
+    });
 
   } catch (error) {
-    return res.status(500).json({ error: 'API Error' });
+    return res.status(500).json({ error: 'API Error', details: error.message });
   }
 });
 
 // ==========================================
-// 2. AI SYNC ROUTE
+// 3. AI PROFILE SYNC ROUTE
 // ==========================================
 app.post('/api/update-ai', async (req, res) => {
   const { customer_id, ai_overview } = req.body;
@@ -77,16 +128,17 @@ app.post('/api/update-ai', async (req, res) => {
   };
 
   try {
-    await fetch(`https://${shopifyDomain}/admin/api/2024-01/graphql.json`, {
+    const shopifyRes = await fetch(`https://${shopifyDomain}/admin/api/2024-01/graphql.json`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': accessToken },
       body: JSON.stringify({ query, variables })
     });
-    res.json({ success: true });
+    const result = await shopifyRes.json();
+    res.json({ success: true, details: result });
   } catch (error) {
-    res.status(500).json({ error: 'Failed' });
+    res.status(500).json({ error: 'Sync Failed' });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server running on ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 API active on ${PORT}`));
