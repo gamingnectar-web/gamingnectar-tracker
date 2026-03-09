@@ -56,31 +56,56 @@ app.get('/api/track', async (req, res) => {
   }
 });
 
-// 2. AI SYNC (GraphQL Metafield Upsert - NOW AS TEXT)
+// 2. AI SYNC (GraphQL Metafield Upsert - WITH STRICT ERROR LOGGING)
 app.post('/api/update-ai', async (req, res) => {
   const { customer_id, ai_overview } = req.body;
   const shopifyDomain = process.env.SHOPIFY_DOMAIN; 
   const accessToken = process.env.SHOPIFY_ACCESS_TOKEN; 
   
-  const query = `mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $metafields) { metafields { id } userErrors { message } } }`;
+  const query = `mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) { 
+    metafieldsSet(metafields: $metafields) { 
+      metafields { id } 
+      userErrors { field message } 
+    } 
+  }`;
   
   const variables = { 
     metafields: [{ 
       ownerId: `gid://shopify/Customer/${customer_id}`, 
       namespace: "custom", 
       key: "ai_overview", 
-      type: "multi_line_text_field", // 🚀 CHANGED TO TEXT FIELD SO IT CAN OVERWRITE!
+      type: "multi_line_text_field", 
       value: ai_overview 
     }] 
   };
   
   try {
-    await fetch(`https://${shopifyDomain}/admin/api/2024-01/graphql.json`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': accessToken },
+    let shopifyRes = await fetch(`https://${shopifyDomain}/admin/api/2024-01/graphql.json`, {
+      method: 'POST', 
+      headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': accessToken },
       body: JSON.stringify({ query, variables })
     });
+    
+    let responseData = await shopifyRes.json();
+    
+    // 🚀 CRITICAL: Catch silent Shopify rejections
+    if (responseData.data?.metafieldsSet?.userErrors?.length > 0) {
+        console.error("🚨 SHOPIFY REJECTED THE UPDATE:", JSON.stringify(responseData.data.metafieldsSet.userErrors));
+        return res.status(400).json({ error: responseData.data.metafieldsSet.userErrors });
+    }
+
+    if (responseData.errors) {
+        console.error("🚨 GRAPHQL SYNTAX ERROR:", JSON.stringify(responseData.errors));
+        return res.status(400).json({ error: responseData.errors });
+    }
+
+    console.log(`✅ Successfully updated AI profile for customer ${customer_id}`);
     res.json({ success: true });
-  } catch (error) { res.status(500).json({ error: 'Sync Failed' }); }
+    
+  } catch (error) { 
+    console.error("🚨 SERVER CRASH:", error);
+    res.status(500).json({ error: 'Sync Failed' }); 
+  }
 });
 
 const PORT = process.env.PORT || 3000;
