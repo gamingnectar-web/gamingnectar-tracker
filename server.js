@@ -56,13 +56,24 @@ app.get('/api/track', async (req, res) => {
   }
 });
 
-// 2. AI SYNC (GraphQL Metafield Upsert)
+// 2. AI SYNC (GraphQL Metafield Upsert - NOW AS TEXT)
 app.post('/api/update-ai', async (req, res) => {
   const { customer_id, ai_overview } = req.body;
   const shopifyDomain = process.env.SHOPIFY_DOMAIN; 
   const accessToken = process.env.SHOPIFY_ACCESS_TOKEN; 
+  
   const query = `mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $metafields) { metafields { id } userErrors { message } } }`;
-  const variables = { metafields: [{ ownerId: `gid://shopify/Customer/${customer_id}`, namespace: "custom", key: "ai_overview", type: "json", value: ai_overview }] };
+  
+  const variables = { 
+    metafields: [{ 
+      ownerId: `gid://shopify/Customer/${customer_id}`, 
+      namespace: "custom", 
+      key: "ai_overview", 
+      type: "multi_line_text_field", // 🚀 CHANGED TO TEXT FIELD SO IT CAN OVERWRITE!
+      value: ai_overview 
+    }] 
+  };
+  
   try {
     await fetch(`https://${shopifyDomain}/admin/api/2024-01/graphql.json`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': accessToken },
