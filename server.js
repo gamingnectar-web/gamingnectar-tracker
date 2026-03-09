@@ -143,5 +143,80 @@ app.get('/api/track', async (req, res) => {
   }
 });
 
+
+// ==========================================
+// 3. 🚀 AI PROFILE SYNC ROUTE (Triggered by Customer Hub)
+// ==========================================
+app.post('/api/update-ai', async (req, res) => {
+  const { customer_id, ai_overview } = req.body;
+
+  if (!customer_id || !ai_overview) {
+    return res.status(400).json({ error: 'Missing customer_id or ai_overview' });
+  }
+
+  // Pull credentials from your Render Environment Variables
+  const shopifyDomain = process.env.SHOPIFY_DOMAIN; 
+  const accessToken = process.env.SHOPIFY_ACCESS_TOKEN; 
+
+  if (!shopifyDomain || !accessToken) {
+    return res.status(500).json({ error: 'Shopify credentials missing from Render environment' });
+  }
+
+  // Shopify GraphQL Mutation to cleanly overwrite/create the metafield
+  const query = `
+    mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        metafields {
+          id
+          key
+          value
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `;
+
+  const variables = {
+    metafields: [
+      {
+        ownerId: `gid://shopify/Customer/${customer_id}`,
+        namespace: "custom",
+        key: "ai_overview",
+        type: "json",
+        value: ai_overview // This receives the stringified JSON from your storefront
+      }
+    ]
+  };
+
+  try {
+    const shopifyRes = await fetch(`https://${shopifyDomain}/admin/api/2024-01/graphql.json`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': accessToken
+      },
+      body: JSON.stringify({ query, variables })
+    });
+
+    const data = await shopifyRes.json();
+    
+    // Catch any Shopify-specific data errors
+    if (data.data?.metafieldsSet?.userErrors?.length > 0) {
+      console.error('🚨 Shopify Metafield Errors:', data.data.metafieldsSet.userErrors);
+      return res.status(400).json({ error: data.data.metafieldsSet.userErrors });
+    }
+
+    console.log(`✅ AI Profile successfully synced to Shopify for Customer ${customer_id}!`);
+    res.json({ success: true, message: "AI Profile successfully synced to Shopify!" });
+
+  } catch (error) {
+    console.error('🚨 Server error updating metafield:', error.message);
+    res.status(500).json({ error: 'Failed to sync with Shopify' });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 API live on port ${PORT}`));
