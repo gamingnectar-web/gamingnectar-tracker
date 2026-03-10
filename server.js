@@ -53,13 +53,13 @@ async function shopifyGraphQL(query, variables = {}) {
     return data;
 }
 
-// 1. TRACKING (Now with X-Ray Vision Logging!)
+// 1. TRACKING (Now with X-Ray Vision Logging & Note Field Fix!)
 app.get('/api/track', async (req, res) => {
   const trackingNumber = String(req.query.number || '').trim();
   const rawCarrier = String(req.query.carrier || '').toLowerCase();
   const productId = req.query.product_id; 
 
-  console.log(`🔍 Received tracking request for: ${trackingNumber} | Product: ${productId || 'None'}`);
+  console.log(`\n🔍 Received tracking request for: ${trackingNumber} | Product: ${productId || 'None'}`);
 
   if (trackingNumber === 'KEEP_ALIVE') return res.json({ status: 'AWAKE' });
   if (!trackingNumber) return res.status(400).json({ error: 'Missing tracking number' });
@@ -89,8 +89,9 @@ app.get('/api/track', async (req, res) => {
         };
 
         if (productId) {
-            createPayload.custom_fields = { shopify_product_id: productId };
-            console.log(`📎 Attaching Product ID to payload: ${productId}`);
+            // 🚀 FIX: Use 'note' instead of 'custom_fields' to bypass strict formatting
+            createPayload.note = productId; 
+            console.log(`📎 Attaching Product ID to payload (in note field): ${productId}`);
         }
 
         let createRes = await fetch('https://api.trackingmore.com/v4/trackings/create', {
@@ -227,12 +228,11 @@ app.post('/api/webhooks/supply-update', async (req, res) => {
     }
 
     const { event, po_number, items } = req.body;
-    console.log(`📦 Received supply event: ${event} for PO: ${po_number}`);
+    console.log(`\n📦 Received supply event: ${event} for PO: ${po_number}`);
 
     try {
         if (event === 'PO_CREATED') {
             for (let item of items) {
-                // Ensure your supply backend passes the Shopify Product GID
                 await updateProductStatus(item.shopify_product_id, 'incoming');
                 console.log(`✅ Tagged ${item.shopify_product_id} as incoming`);
             }
@@ -254,24 +254,25 @@ app.post('/api/webhooks/trackingmore-update', async (req, res) => {
     const trackingData = req.body;
     const currentStatus = trackingData.data?.delivery_status || trackingData.status;
     
-    console.log(`🚚 TrackingMore Update: ${trackingData.tracking_number} is now ${currentStatus}`);
+    console.log(`\n🚚 TrackingMore Webhook Fired! Package: ${trackingData.data?.tracking_number || trackingData.tracking_number} is now ${currentStatus}`);
 
     if (currentStatus === 'delivered') {
         try {
-            // NOTE: You will need to map the tracking number to a Shopify Product ID here.
-            // For now, assuming your payload includes a custom field with the product ID:
-            const productId = trackingData.custom_fields?.shopify_product_id; 
+            // 🚀 FIX: Grab the Product ID from the 'note' field where we stored it!
+            const productId = trackingData.data?.note || trackingData.note; 
             
             if (productId) {
                 await updateProductStatus(productId, 'restocked');
                 console.log(`✅ Item delivered! Tagged ${productId} as restocked.`);
+            } else {
+                console.log(`⚠️ Delivered, but no Product ID found in the note field.`);
             }
         } catch (error) {
             console.error('🚨 TrackingMore Webhook Error:', error.message);
         }
     }
     
-    res.status(200).send('OK'); // Always return 200 fast to webhooks
+    res.status(200).send('OK'); 
 });
 
 const PORT = process.env.PORT || 3000;
