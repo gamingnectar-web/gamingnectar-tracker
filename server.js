@@ -53,13 +53,13 @@ async function shopifyGraphQL(query, variables = {}) {
     return data;
 }
 
-// 1. TRACKING (Updated to pass Product ID to TrackingMore)
+// 1. TRACKING (Now with X-Ray Vision Logging!)
 app.get('/api/track', async (req, res) => {
   const trackingNumber = String(req.query.number || '').trim();
   const rawCarrier = String(req.query.carrier || '').toLowerCase();
-  
-  // 🚀 NEW: Grab the product ID from the URL if it exists
   const productId = req.query.product_id; 
+
+  console.log(`🔍 Received tracking request for: ${trackingNumber} | Product: ${productId || 'None'}`);
 
   if (trackingNumber === 'KEEP_ALIVE') return res.json({ status: 'AWAKE' });
   if (!trackingNumber) return res.status(400).json({ error: 'Missing tracking number' });
@@ -71,15 +71,18 @@ app.get('/api/track', async (req, res) => {
 
   try {
     const apiKey = process.env.TRACKINGMORE_API_KEY;
+    
+    // 1. Check if it exists
     let getResponse = await fetch(`https://api.trackingmore.com/v4/trackings/get?tracking_numbers=${trackingNumber}`, {
       method: 'GET',
       headers: { 'Tracking-Api-Key': apiKey, 'Content-Type': 'application/json' }
     });
-    
     let data = await getResponse.json();
     
+    // 2. If it DOES NOT exist, create it
     if (!data.data || data.data.length === 0) {
-        // 🚀 NEW: Add the custom_fields payload here so TrackingMore remembers it!
+        console.log(`📦 Tracking number not found in TrackingMore. Attempting to create...`);
+        
         const createPayload = { 
             tracking_number: trackingNumber, 
             courier_code: courierCode 
@@ -87,16 +90,25 @@ app.get('/api/track', async (req, res) => {
 
         if (productId) {
             createPayload.custom_fields = { shopify_product_id: productId };
+            console.log(`📎 Attaching Product ID to payload: ${productId}`);
         }
 
-        await fetch('https://api.trackingmore.com/v4/trackings/create', {
+        let createRes = await fetch('https://api.trackingmore.com/v4/trackings/create', {
           method: 'POST',
           headers: { 'Tracking-Api-Key': apiKey, 'Content-Type': 'application/json' },
           body: JSON.stringify(createPayload)
         });
-        return res.json({ status: 'PENDING', history: [] });
+        
+        let createData = await createRes.json();
+        
+        // LOG THE RESPONSE FROM TRACKINGMORE!
+        console.log(`📥 TrackingMore Creation Response:`, JSON.stringify(createData));
+
+        return res.json({ status: 'PENDING', history: [], debug: createData });
     }
 
+    // 3. If it DOES exist, process the history
+    console.log(`✅ Tracking number found in TrackingMore. Processing history...`);
     let tmStatus = data.data[0].delivery_status || 'pending';
     let trackHistory = data.data[0].origin_info?.trackinfo || data.data[0].trackinfo || [];
 
@@ -113,6 +125,7 @@ app.get('/api/track', async (req, res) => {
       }))
     });
   } catch (error) {
+    console.error(`🚨 Fatal Error in /api/track:`, error.message);
     return res.status(500).json({ error: 'Internal Error' });
   }
 });
