@@ -53,10 +53,14 @@ async function shopifyGraphQL(query, variables = {}) {
     return data;
 }
 
-// 1. TRACKING (Your original logic)
+// 1. TRACKING (Updated to pass Product ID to TrackingMore)
 app.get('/api/track', async (req, res) => {
   const trackingNumber = String(req.query.number || '').trim();
   const rawCarrier = String(req.query.carrier || '').toLowerCase();
+  
+  // 🚀 NEW: Grab the product ID from the URL if it exists
+  const productId = req.query.product_id; 
+
   if (trackingNumber === 'KEEP_ALIVE') return res.json({ status: 'AWAKE' });
   if (!trackingNumber) return res.status(400).json({ error: 'Missing tracking number' });
 
@@ -75,10 +79,20 @@ app.get('/api/track', async (req, res) => {
     let data = await getResponse.json();
     
     if (!data.data || data.data.length === 0) {
+        // 🚀 NEW: Add the custom_fields payload here so TrackingMore remembers it!
+        const createPayload = { 
+            tracking_number: trackingNumber, 
+            courier_code: courierCode 
+        };
+
+        if (productId) {
+            createPayload.custom_fields = { shopify_product_id: productId };
+        }
+
         await fetch('https://api.trackingmore.com/v4/trackings/create', {
           method: 'POST',
           headers: { 'Tracking-Api-Key': apiKey, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ tracking_number: trackingNumber, courier_code: courierCode })
+          body: JSON.stringify(createPayload)
         });
         return res.json({ status: 'PENDING', history: [] });
     }
