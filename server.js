@@ -59,7 +59,7 @@ app.get('/api/track', async (req, res) => {
   const rawCarrier = String(req.query.carrier || '').toLowerCase();
   const productId = req.query.product_id; 
 
-  console.log(`\n🔍 Received tracking request for: ${trackingNumber} | Product: ${productId || 'None'}`);
+  console.log(`\n🔍 Received tracking request for: ${trackingNumber} | Product(s): ${productId || 'None'}`);
 
   if (trackingNumber === 'KEEP_ALIVE') return res.json({ status: 'AWAKE' });
   if (!trackingNumber) return res.status(400).json({ error: 'Missing tracking number' });
@@ -91,7 +91,7 @@ app.get('/api/track', async (req, res) => {
         if (productId) {
             // 🚀 FIX: Use 'note' instead of 'custom_fields' to bypass strict formatting
             createPayload.note = productId; 
-            console.log(`📎 Attaching Product ID to payload (in note field): ${productId}`);
+            console.log(`📎 Attaching Product ID(s) to payload (in note field): ${productId}`);
         }
 
         let createRes = await fetch('https://api.trackingmore.com/v4/trackings/create', {
@@ -220,9 +220,8 @@ async function generateDiscountCode(poNumber) {
     return codeName;
 }
 
-// 3. SUPPLY BACKEND WEBHOOK (Triggers when PO created or delayed)
+// 3. SUPPLY BACKEND WEBHOOK (Kept active just in case you ever need it!)
 app.post('/api/webhooks/supply-update', async (req, res) => {
-    // Add a simple secret check so randos can't hit this endpoint
     if (req.headers['x-supply-secret'] !== process.env.SUPPLY_WEBHOOK_SECRET) {
         return res.status(403).json({ error: 'Unauthorized' });
     }
@@ -258,12 +257,20 @@ app.post('/api/webhooks/trackingmore-update', async (req, res) => {
 
     if (currentStatus === 'delivered') {
         try {
-            // 🚀 FIX: Grab the Product ID from the 'note' field where we stored it!
-            const productId = trackingData.data?.note || trackingData.note; 
+            // 🚀 FIX: Grab the Product IDs string from the 'note' field
+            const productIdsString = trackingData.data?.note || trackingData.note; 
             
-            if (productId) {
-                await updateProductStatus(productId, 'restocked');
-                console.log(`✅ Item delivered! Tagged ${productId} as restocked.`);
+            if (productIdsString) {
+                // Split them up in case there are multiple items in the box (e.g., "id1,id2,id3")
+                const productIds = productIdsString.split(',');
+
+                for (let id of productIds) {
+                    const cleanId = id.trim();
+                    if (cleanId) {
+                        await updateProductStatus(cleanId, 'restocked');
+                        console.log(`✅ Item delivered! Tagged ${cleanId} as restocked.`);
+                    }
+                }
             } else {
                 console.log(`⚠️ Delivered, but no Product ID found in the note field.`);
             }
@@ -274,6 +281,81 @@ app.post('/api/webhooks/trackingmore-update', async (req, res) => {
     
     res.status(200).send('OK'); 
 });
+
+// =====================================================================
+// 🕒 NEW: AUTO-POLLER (Bypasses Shopify Flow Paywall)
+// =====================================================================
+
+// We keep a temporary memory of POs we've seen so we don't spam your logs
+const processedPOs = new Set();
+
+async function pollShopifyPOs() {
+    console.log("🕵️ Polling Shopify for new Purchase Orders...");
+    try {
+        // Ask Shopify for the 10 most recently updated POs that are currently 'ORDERED'
+        const query = `
+            {
+                purchaseOrders(first: 10, query: "status:ORDERED", sortKey: UPDATED_AT, reverse: true) {
+                    edges {
+                        node {
+                            id
+                            name
+                            lineItems(first: 50) {
+                                edges {
+                                    node {
+                                        variant {
+                                            product {
+                                                id
+                                                tags
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        `;
+        
+        const response = await shopifyGraphQL(query);
+        const pos = response.data?.purchaseOrders?.edges || [];
+
+        for (let poEdge of pos) {
+            const po = poEdge.node;
+            
+            // Skip if we already processed this PO since the server started
+            if (processedPOs.has(po.id)) continue;
+
+            console.log(`📦 Found new active PO: ${po.name}`);
+            
+            const items = po.lineItems.edges;
+            for (let itemEdge of items) {
+                const product = itemEdge.node.variant?.product;
+                if (!product) continue; // Skip if the line item somehow has no product
+                
+                // Smart Check: Only update if it doesn't already have the tag!
+                if (!product.tags.includes('incoming')) {
+                    await updateProductStatus(product.id, 'incoming');
+                    console.log(`✅ Auto-Poller tagged ${product.id} as incoming (from ${po.name})`);
+                }
+            }
+            
+            // Add to our memory so we don't check it again next loop
+            processedPOs.add(po.id);
+        }
+    } catch (error) {
+        console.error("🚨 Poller Error:", error.message);
+    }
+}
+
+// ⏱️ Run the poller every 15 minutes (900,000 milliseconds)
+setInterval(pollShopifyPOs, 15 * 60 * 1000);
+
+// 🚀 Run it once immediately 5 seconds after the server boots up
+setTimeout(pollShopifyPOs, 5000);
+
+// =====================================================================
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 API active on ${PORT}`));
