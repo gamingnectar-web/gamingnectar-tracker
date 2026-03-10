@@ -15,7 +15,6 @@ async function getShopifyToken() {
       throw new Error("Missing Client ID or Secret in Render Environment.");
   }
 
-  // Exchanges the Client ID and Secret for a temporary 24-hour access token
   const response = await fetch(`https://${shopifyDomain}/admin/oauth/access_token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -34,7 +33,27 @@ async function getShopifyToken() {
   }
 }
 
-// 1. TRACKING (Restored to exact previous working logic)
+// --- 🛠️ HELPER: UNIVERSAL SHOPIFY GRAPHQL CALLER ---
+async function shopifyGraphQL(query, variables = {}) {
+    const shopifyDomain = process.env.SHOPIFY_DOMAIN;
+    const accessToken = await getShopifyToken();
+    
+    // Using 2024-01 to match your existing code, but upgrade to 2026-01 when ready
+    const response = await fetch(`https://${shopifyDomain}/admin/api/2024-01/graphql.json`, {
+        method: 'POST',
+        headers: { 
+            'Content-Type': 'application/json', 
+            'X-Shopify-Access-Token': accessToken 
+        },
+        body: JSON.stringify({ query, variables })
+    });
+    
+    const data = await response.json();
+    if (data.errors) throw new Error(JSON.stringify(data.errors));
+    return data;
+}
+
+// 1. TRACKING (Your original logic)
 app.get('/api/track', async (req, res) => {
   const trackingNumber = String(req.query.number || '').trim();
   const rawCarrier = String(req.query.carrier || '').toLowerCase();
@@ -67,7 +86,6 @@ app.get('/api/track', async (req, res) => {
     let tmStatus = data.data[0].delivery_status || 'pending';
     let trackHistory = data.data[0].origin_info?.trackinfo || data.data[0].trackinfo || [];
 
-    // Map to frontend labels
     let currentStatus = 'IN_TRANSIT';
     if (tmStatus === 'delivered') currentStatus = 'DELIVERED';
     else if (['pickup', 'outfordelivery'].includes(tmStatus)) currentStatus = 'OUT_FOR_DELIVERY';
@@ -85,15 +103,11 @@ app.get('/api/track', async (req, res) => {
   }
 });
 
-// 2. AI SYNC (Shopify 2026 OAuth Compatible)
+// 2. AI SYNC (Your original logic)
 app.post('/api/update-ai', async (req, res) => {
   const { customer_id, ai_overview } = req.body;
-  const shopifyDomain = process.env.SHOPIFY_DOMAIN; 
   
   try {
-    // 1. Fetch the temporary 24-hour key dynamically!
-    const accessToken = await getShopifyToken();
-
     const query = `mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) { 
       metafieldsSet(metafields: $metafields) { 
         metafields { id } 
@@ -111,23 +125,11 @@ app.post('/api/update-ai', async (req, res) => {
       }] 
     };
     
-    let shopifyRes = await fetch(`https://${shopifyDomain}/admin/api/2024-01/graphql.json`, {
-      method: 'POST', 
-      headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': accessToken },
-      body: JSON.stringify({ query, variables })
-    });
+    let responseData = await shopifyGraphQL(query, variables);
     
-    let responseData = await shopifyRes.json();
-    
-    // 🚀 CRITICAL: Catch silent Shopify rejections
     if (responseData.data?.metafieldsSet?.userErrors?.length > 0) {
         console.error("🚨 SHOPIFY REJECTED THE UPDATE:", JSON.stringify(responseData.data.metafieldsSet.userErrors));
         return res.status(400).json({ error: responseData.data.metafieldsSet.userErrors });
-    }
-
-    if (responseData.errors) {
-        console.error("🚨 GRAPHQL SYNTAX ERROR:", JSON.stringify(responseData.errors));
-        return res.status(400).json({ error: responseData.errors });
     }
 
     console.log(`✅ Successfully updated AI profile for customer ${customer_id}`);
@@ -137,6 +139,112 @@ app.post('/api/update-ai', async (req, res) => {
     console.error("🚨 SERVER CRASH:", error.message);
     res.status(500).json({ error: 'Sync Failed', details: error.message }); 
   }
+});
+
+// =====================================================================
+// 📦 NEW: SUPPLY CHAIN & INVENTORY LOGIC
+// =====================================================================
+
+// HELPER: Add/Remove 'incoming' and 'restocked' tags
+async function updateProductStatus(productId, newTag) {
+    const query = `
+        mutation updateProduct($input: ProductInput!) {
+            productUpdate(input: $input) {
+                product { id tags }
+                userErrors { field message }
+            }
+        }
+    `;
+    const input = {
+        id: productId,
+        tags: [newTag] 
+    };
+    const result = await shopifyGraphQL(query, { input });
+    if (result.data?.productUpdate?.userErrors?.length > 0) {
+        throw new Error(JSON.stringify(result.data.productUpdate.userErrors));
+    }
+    return result;
+}
+
+// HELPER: Generate 'Patience' Discount Code
+async function generateDiscountCode(poNumber) {
+    const codeName = `DELAY-${poNumber}-${Math.floor(Math.random() * 1000)}`;
+    const query = `
+        mutation discountCodeBasicCreate($basicCodeDiscount: DiscountCodeBasicInput!) {
+            discountCodeBasicCreate(basicCodeDiscount: $basicCodeDiscount) {
+                codeDiscountNode { id codeDiscount { ... on DiscountCodeBasic { codes(first: 1) { nodes { code } } } } }
+                userErrors { field message }
+            }
+        }
+    `;
+    const variables = {
+        basicCodeDiscount: {
+            title: `Apology Discount for PO ${poNumber}`,
+            code: codeName,
+            startsAt: new Date().toISOString(),
+            customerSelection: { all: true },
+            customerGets: { value: { percentage: 0.10 }, items: { all: true } },
+            appliesOncePerCustomer: true
+        }
+    };
+    
+    await shopifyGraphQL(query, variables);
+    return codeName;
+}
+
+// 3. SUPPLY BACKEND WEBHOOK (Triggers when PO created or delayed)
+app.post('/api/webhooks/supply-update', async (req, res) => {
+    // Add a simple secret check so randos can't hit this endpoint
+    if (req.headers['x-supply-secret'] !== process.env.SUPPLY_WEBHOOK_SECRET) {
+        return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    const { event, po_number, items } = req.body;
+    console.log(`📦 Received supply event: ${event} for PO: ${po_number}`);
+
+    try {
+        if (event === 'PO_CREATED') {
+            for (let item of items) {
+                // Ensure your supply backend passes the Shopify Product GID
+                await updateProductStatus(item.shopify_product_id, 'incoming');
+                console.log(`✅ Tagged ${item.shopify_product_id} as incoming`);
+            }
+        } 
+        else if (event === 'PO_DELAYED') {
+            const discountCode = await generateDiscountCode(po_number);
+            console.log(`🎟️ Created apology discount code: ${discountCode}`);
+        }
+        
+        res.status(200).json({ success: true });
+    } catch (error) {
+        console.error('🚨 Supply Webhook Error:', error.message);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+// 4. TRACKINGMORE WEBHOOK (Triggers when status changes to 'Delivered')
+app.post('/api/webhooks/trackingmore-update', async (req, res) => {
+    const trackingData = req.body;
+    const currentStatus = trackingData.data?.delivery_status || trackingData.status;
+    
+    console.log(`🚚 TrackingMore Update: ${trackingData.tracking_number} is now ${currentStatus}`);
+
+    if (currentStatus === 'delivered') {
+        try {
+            // NOTE: You will need to map the tracking number to a Shopify Product ID here.
+            // For now, assuming your payload includes a custom field with the product ID:
+            const productId = trackingData.custom_fields?.shopify_product_id; 
+            
+            if (productId) {
+                await updateProductStatus(productId, 'restocked');
+                console.log(`✅ Item delivered! Tagged ${productId} as restocked.`);
+            }
+        } catch (error) {
+            console.error('🚨 TrackingMore Webhook Error:', error.message);
+        }
+    }
+    
+    res.status(200).send('OK'); // Always return 200 fast to webhooks
 });
 
 const PORT = process.env.PORT || 3000;
