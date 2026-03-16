@@ -174,6 +174,48 @@ app.post('/api/update-ai', async (req, res) => {
 });
 
 // =====================================================================
+// 3. SHOPIFY FULFILLMENT WEBHOOK (AUTO-REGISTER TO 17TRACK)
+// =====================================================================
+app.post('/api/webhooks/fulfillment', async (req, res) => {
+  // Always respond to Shopify quickly so they don't think the server is dead
+  res.status(200).send('OK'); 
+
+  try {
+    const fulfillment = req.body;
+    const trackingNumber = fulfillment.tracking_number || (fulfillment.tracking_numbers && fulfillment.tracking_numbers[0]);
+    const rawCarrier = fulfillment.tracking_company || '';
+
+    if (!trackingNumber) return;
+
+    console.log(`\n🚀 Shopify Fulfillment triggered! Auto-registering ${trackingNumber} with 17TRACK...`);
+
+    const normalizedCarrier = rawCarrier.toLowerCase().replace(/[^a-z0-9]/g, '');
+    let carrierId = null;
+
+    if (normalizedCarrier.includes('royalmail') || trackingNumber.toUpperCase().endsWith('GB')) carrierId = 3011;
+    else if (normalizedCarrier.includes('evri') || normalizedCarrier.includes('hermes')) carrierId = 10026; 
+    else if (normalizedCarrier.includes('dpd')) carrierId = 10019;
+    else if (normalizedCarrier.includes('dhl')) carrierId = 10001;
+
+    const apiKey = process.env.TRACK17_API_KEY;
+    if (!apiKey) throw new Error("Missing TRACK17_API_KEY");
+
+    const trackingPayload = [{ number: trackingNumber }];
+    if (carrierId) trackingPayload[0].carrier = carrierId;
+
+    await fetch('https://api.17track.net/track/v2.4/register', {
+      method: 'POST', 
+      headers: { '17token': apiKey, 'Content-Type': 'application/json' }, 
+      body: JSON.stringify(trackingPayload)
+    });
+
+    console.log(`✅ Successfully auto-registered ${trackingNumber} in 17TRACK!`);
+  } catch (error) {
+    console.error(`🚨 Fulfillment Webhook Error:`, error.message);
+  }
+});
+
+// =====================================================================
 // SERVER STARTUP
 // =====================================================================
 const PORT = process.env.PORT || 3000;
