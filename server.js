@@ -5,173 +5,118 @@ const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// --- 🚀 SHOPIFY AUTO-AUTHENTICATOR ---
-async function getShopifyToken() {
-  const shopifyDomain = process.env.SHOPIFY_DOMAIN;
-  const clientId = process.env.SHOPIFY_CLIENT_ID;
-  const clientSecret = process.env.SHOPIFY_CLIENT_SECRET;
+// --- 🛠️ HELPER: 17TRACK ID MAPPING (UK 2026 VERIFIED) ---
+function getCarrierId(rawCarrier, trackingNumber) {
+    const normalized = String(rawCarrier || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const num = String(trackingNumber || '').toUpperCase();
 
-  if (!clientId || !clientSecret) {
-    throw new Error("Missing Shopify Credentials in Environment.");
-  }
-
-  const response = await fetch(`https://${shopifyDomain}/admin/oauth/access_token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'client_credentials',
-      client_id: clientId,
-      client_secret: clientSecret
-    })
-  });
-
-  const data = await response.json();
-  if (data.access_token) return data.access_token;
-  throw new Error("Shopify Token generation failed.");
-}
-
-// --- 🛠️ HELPER: SHOPIFY GRAPHQL CALLER ---
-async function shopifyGraphQL(query, variables = {}) {
-  const shopifyDomain = process.env.SHOPIFY_DOMAIN;
-  const accessToken = await getShopifyToken();
-  const response = await fetch(`https://${shopifyDomain}/admin/api/2024-01/graphql.json`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': accessToken },
-    body: JSON.stringify({ query, variables })
-  });
-  const data = await response.json();
-  if (data.errors) throw new Error(JSON.stringify(data.errors));
-  return data;
+    // 100011 is the specific UK Royal Mail domestic ID
+    if (normalized.includes('royalmail') || num.endsWith('GB')) return 100011; 
+    
+    // 100026 is the 2026 updated Evri/Hermes UK ID
+    if (normalized.includes('evri') || normalized.includes('hermes')) return 100026;
+    
+    // 100019 is the DPD UK specific network
+    if (normalized.includes('dpd')) return 100019;
+    
+    // 100001 is global DHL Express
+    if (normalized.includes('dhl')) return 100001;
+    
+    return null; // Fallback to Auto-Detect
 }
 
 // =====================================================================
-// 1. TRACKING API (FOR CUSTOMER HUB ON-DEMAND)
+// 1. TRACKING API (FOR CUSTOMER HUB)
 // =====================================================================
 app.get('/api/track', async (req, res) => {
   const trackingNumber = String(req.query.number || '').trim();
-  const rawCarrier = String(req.query.carrier || '').toLowerCase();
+  const carrierId = getCarrierId(req.query.carrier, trackingNumber);
 
   if (trackingNumber === 'KEEP_ALIVE') return res.json({ status: 'AWAKE' });
-  if (!trackingNumber) return res.status(400).json({ error: 'Missing tracking number' });
-
-  // Carrier normalization for 17TRACK IDs
-  const normalizedCarrier = rawCarrier.replace(/[^a-z0-9]/g, '');
-  let carrierId = null;
-
-  if (normalizedCarrier.includes('royalmail') || trackingNumber.toUpperCase().endsWith('GB')) carrierId = 21041;
-  else if (normalizedCarrier.includes('evri') || normalizedCarrier.includes('hermes')) carrierId = 20061;
-  else if (normalizedCarrier.includes('dpd')) carrierId = 20071;
-  else if (normalizedCarrier.includes('dhl')) carrierId = 20001;
+  if (!trackingNumber) return res.status(400).json({ error: 'Missing number' });
 
   try {
     const apiKey = process.env.TRACK17_API_KEY;
     const headers = { '17token': apiKey, 'Content-Type': 'application/json' };
-    const trackingPayload = [{ number: trackingNumber }];
-    if (carrierId) trackingPayload[0].carrier = carrierId;
+    const payload = [{ number: trackingNumber, carrier: carrierId }];
 
-    // Register Number
-    await fetch('https://api.17track.net/track/v2.4/register', {
-      method: 'POST', headers, body: JSON.stringify(trackingPayload)
-    });
+    // STEP 1: Always register/retrack to ensure we aren't seeing cached "China Post" data
+    await fetch('https://api.17track.net/track/v2.4/register', { method: 'POST', headers, body: JSON.stringify(payload) });
+    
+    // STEP 2: Fetch the data
+    let infoRes = await fetch('https://api.17track.net/track/v2.4/gettrackinfo', { method: 'POST', headers, body: JSON.stringify(payload) });
+    let infoData = await infoRes.json();
+    let track = infoData.data?.accepted?.[0]?.track_info;
 
-    // Get Info (Strictly passing carrierId to avoid China Post defaults)
-    const infoRes = await fetch('https://api.17track.net/track/v2.4/gettrackinfo', {
-      method: 'POST', headers, body: JSON.stringify(trackingPayload)
-    });
+    // STEP 3: AGGRESSIVE RETRY (If 17TRACK is being slow or showing China Post [3011])
+    if (!track || track.latest_status?.status === 'NotFound' || track.latest_status?.carrier_id === 3011) {
+      console.log(`Force-refreshing ${trackingNumber} for Royal Mail...`);
+      await fetch('https://api.17track.net/track/v2.4/retrack', { method: 'POST', headers, body: JSON.stringify(payload) });
+      await new Promise(r => setTimeout(r, 2000)); // Wait for the courier's server to respond
+      
+      infoRes = await fetch('https://api.17track.net/track/v2.4/gettrackinfo', { method: 'POST', headers, body: JSON.stringify(payload) });
+      infoData = await infoRes.json();
+      track = infoData.data?.accepted?.[0]?.track_info;
+    }
 
-    const infoData = await infoRes.json();
-    const trackData = infoData.data?.accepted?.[0]?.track_info;
+    if (!track || !track.tracking) return res.json({ status: 'PENDING', history: [] });
 
-    if (!trackData || !trackData.tracking) return res.json({ status: 'PENDING', history: [] });
-
+    // Map status to your Hub's UI
     let currentStatus = 'IN_TRANSIT';
-    const tmStatus = trackData.latest_status?.status;
-    if (tmStatus === 'Delivered') currentStatus = 'DELIVERED';
-    else if (tmStatus === 'OutForDelivery' || tmStatus === 'AvailableForPickup') currentStatus = 'OUT_FOR_DELIVERY';
+    const status = track.latest_status?.status;
+    if (status === 'Delivered') currentStatus = 'DELIVERED';
+    else if (['OutForDelivery', 'AvailableForPickup'].includes(status)) currentStatus = 'OUT_FOR_DELIVERY';
 
-    const rawEvents = trackData.tracking?.providers?.[0]?.events || [];
-    rawEvents.sort((a, b) => new Date(b.time_iso || b.time) - new Date(a.time_iso || a.time));
+    const rawEvents = track.tracking?.providers?.[0]?.events || [];
+    
+    return res.json({
+      status: currentStatus,
+      history: rawEvents.sort((a,b) => new Date(b.time_iso) - new Date(a.time_iso)).map(e => ({
+        date: e.time_iso || e.time, 
+        detail: e.description, 
+        location: e.location || ''
+      }))
+    });
 
-    const formattedHistory = rawEvents.map(event => ({
-      date: event.time_iso || event.time || '',
-      detail: event.description || 'Update received',
-      location: event.location || ''
-    }));
-
-    return res.json({ status: currentStatus, history: formattedHistory });
   } catch (error) {
-    console.error(`🚨 Track API Error:`, error.message);
+    console.error(`🚨 Fatal Error:`, error.message);
     return res.status(500).json({ error: 'Internal Error' });
   }
 });
 
 // =====================================================================
-// 2. SHOPIFY FULFILLMENT WEBHOOK (AUTO-SYNC TO 17TRACK)
+// 2. SHOPIFY FULFILLMENT WEBHOOK (AUTO-SYNC)
 // =====================================================================
 app.post('/api/webhooks/fulfillment', async (req, res) => {
-  res.status(200).send('OK'); 
-
+  res.status(200).send('OK');
   try {
-    const fulfillment = req.body;
-    const trackingNumber = fulfillment.tracking_number || (fulfillment.tracking_numbers && fulfillment.tracking_numbers[0]);
-    const rawCarrier = fulfillment.tracking_company || '';
-
-    if (!trackingNumber) return;
-
-    console.log(`\n🚀 Shopify Fulfillment Webhook! Processing ${trackingNumber}...`);
-
-    const normalizedCarrier = rawCarrier.toLowerCase().replace(/[^a-z0-9]/g, '');
-    let carrierId = null;
-
-    if (normalizedCarrier.includes('royalmail') || trackingNumber.toUpperCase().endsWith('GB')) carrierId = 21041;
-    else if (normalizedCarrier.includes('evri') || normalizedCarrier.includes('hermes')) carrierId = 20061;
-    else if (normalizedCarrier.includes('dpd')) carrierId = 20071;
-    else if (normalizedCarrier.includes('dhl')) carrierId = 20001;
-
-    const apiKey = process.env.TRACK17_API_KEY;
-    const trackingPayload = [{ number: trackingNumber }];
-    if (carrierId) trackingPayload[0].carrier = carrierId;
+    const f = req.body;
+    const num = f.tracking_number || f.tracking_numbers?.[0];
+    const carrierId = getCarrierId(f.tracking_company, num);
+    if (!num) return;
 
     await fetch('https://api.17track.net/track/v2.4/register', {
       method: 'POST',
-      headers: { '17token': apiKey, 'Content-Type': 'application/json' },
-      body: JSON.stringify(trackingPayload)
+      headers: { '17token': process.env.TRACK17_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify([{ number: num, carrier: carrierId }])
     });
-
-    console.log(`✅ Successfully auto-registered ${trackingNumber} in 17TRACK!`);
-  } catch (error) {
-    console.error(`🚨 Webhook Error:`, error.message);
-  }
+    console.log(`✅ Auto-registered fulfillment ${num} (ID: ${carrierId})`);
+  } catch (e) { console.error(`🚨 Webhook Error:`, e.message); }
 });
 
 // =====================================================================
-// 3. AI PROFILE SYNC
+// 3. 17TRACK DELIVERY WEBHOOK
 // =====================================================================
-app.post('/api/update-ai', async (req, res) => {
-  const { customer_id, ai_overview } = req.body;
+app.post('/api/webhooks/17track-update', async (req, res) => {
+  res.status(200).json({ code: 0, message: "success" });
   try {
-    const query = `mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
-      metafieldsSet(metafields: $metafields) {
-        metafields { id }
-        userErrors { field message }
-      }
-    }`;
-    const variables = {
-      metafields: [{
-        ownerId: `gid://shopify/Customer/${customer_id}`,
-        namespace: "custom", key: "ai_overview",
-        type: "multi_line_text_field", value: ai_overview
-      }]
-    };
-    await shopifyGraphQL(query, variables);
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: 'AI Sync Failed' });
-  }
+    const track = req.body.track_info;
+    if (track?.latest_status?.status === 'Delivered') {
+      console.log(`🎊 Package ${track.tracking_number} delivered!`);
+    }
+  } catch (e) { console.error(e.message); }
 });
 
-// =====================================================================
-// SERVER STARTUP
-// =====================================================================
+// --- SERVER SETUP ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 API active on ${PORT}`));
