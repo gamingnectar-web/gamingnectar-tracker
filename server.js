@@ -64,16 +64,10 @@ app.get('/api/track', async (req, res) => {
   if (trackingNumber === 'KEEP_ALIVE') return res.json({ status: 'AWAKE' });
   if (!trackingNumber) return res.status(400).json({ error: 'Missing tracking number' });
 
-  // 🚀 FIX: Strip out all spaces/dashes so "Royal Mail" or "royal_mail" matches perfectly
   const normalizedCarrier = rawCarrier.replace(/[^a-z0-9]/g, '');
 
-  // 17TRACK uses numeric carrier IDs. 3011 is Royal Mail. 
   let carrierId = null;
-  
-  // If Shopify says Royal Mail, OR if the tracking number ends in 'GB', force Royal Mail (3011)
-  if (normalizedCarrier.includes('royalmail') || trackingNumber.toUpperCase().endsWith('GB')) {
-      carrierId = 3011;
-  }
+  if (normalizedCarrier.includes('royalmail') || trackingNumber.toUpperCase().endsWith('GB')) carrierId = 3011;
   else if (normalizedCarrier.includes('evri') || normalizedCarrier.includes('hermes')) carrierId = 10026; 
   else if (normalizedCarrier.includes('dpd')) carrierId = 10019;
   else if (normalizedCarrier.includes('dhl')) carrierId = 10001;
@@ -82,49 +76,49 @@ app.get('/api/track', async (req, res) => {
     const apiKey = process.env.TRACK17_API_KEY;
     if (!apiKey) throw new Error("Missing TRACK17_API_KEY in environment variables.");
 
-    const headers = {
-      '17token': apiKey,
-      'Content-Type': 'application/json'
-    };
+    const headers = { '17token': apiKey, 'Content-Type': 'application/json' };
 
-    // STEP 1: Register the tracking number in 17TRACK with the strict Carrier ID
+    // STEP 1: Tell 17TRACK that Royal Mail is the FINAL destination carrier
     const registerPayload = [{ number: trackingNumber }];
-    if (carrierId) registerPayload[0].carrier = carrierId;
+    if (carrierId) {
+        registerPayload[0].carrier = carrierId;
+        registerPayload[0].final_carrier = carrierId; // Forces Royal Mail as destination
+    }
 
     await fetch('https://api.17track.net/track/v2.4/register', {
-      method: 'POST',
-      headers: headers,
-      body: JSON.stringify(registerPayload)
+      method: 'POST', headers: headers, body: JSON.stringify(registerPayload)
     });
 
     // STEP 2: Fetch the actual tracking info
     const infoRes = await fetch('https://api.17track.net/track/v2.4/gettrackinfo', {
-      method: 'POST',
-      headers: headers,
-      body: JSON.stringify([{ number: trackingNumber }])
+      method: 'POST', headers: headers, body: JSON.stringify([{ number: trackingNumber }])
     });
 
     const infoData = await infoRes.json();
     const trackData = infoData.data?.accepted?.[0]?.track_info;
 
-    // If 17TRACK hasn't found data yet, return pending
     if (!trackData || !trackData.tracking) {
-      console.log(`📥 17TRACK Pending/Not Found Response:`, JSON.stringify(infoData));
       return res.json({ status: 'PENDING', history: [] });
     }
 
-    console.log(`✅ 17TRACK Tracker active. Status: ${trackData.latest_status?.status}`);
-
-    // STEP 3: Map 17TRACK status to your Frontend's expected status
+    // STEP 3: Map 17TRACK status
     let currentStatus = 'IN_TRANSIT';
     const tmStatus = trackData.latest_status?.status;
     
     if (tmStatus === 'Delivered') currentStatus = 'DELIVERED';
     else if (tmStatus === 'OutForDelivery' || tmStatus === 'AvailableForPickup') currentStatus = 'OUT_FOR_DELIVERY';
 
-    // Map history events so they show up beautifully on your Customer Hub timeline
-    const rawEvents = trackData.tracking?.providers?.[0]?.events || [];
+    // 🚀 FIX: Merge events from ALL carriers (Origin + Final Destination)
+    let rawEvents = [];
+    if (trackData.tracking?.providers) {
+        trackData.tracking.providers.forEach(provider => {
+            if (provider.events) rawEvents = rawEvents.concat(provider.events);
+        });
+    }
     
+    // Sort events by time (newest first)
+    rawEvents.sort((a, b) => new Date(b.time_iso || b.time) - new Date(a.time_iso || a.time));
+
     const formattedHistory = rawEvents.map(event => ({
       date: event.time_iso || event.time || '', 
       detail: event.description || 'Update received',
