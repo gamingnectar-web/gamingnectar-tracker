@@ -58,10 +58,10 @@ app.get('/api/track', async (req, res) => {
   const normalizedCarrier = rawCarrier.replace(/[^a-z0-9]/g, '');
   let carrierId = null;
 
-  if (normalizedCarrier.includes('royalmail') || trackingNumber.toUpperCase().endsWith('GB')) carrierId = 3011;
-  else if (normalizedCarrier.includes('evri') || normalizedCarrier.includes('hermes')) carrierId = 10026;
-  else if (normalizedCarrier.includes('dpd')) carrierId = 10019;
-  else if (normalizedCarrier.includes('dhl')) carrierId = 10001;
+  if (normalizedCarrier.includes('royalmail') || trackingNumber.toUpperCase().endsWith('GB')) carrierId = 21041;
+  else if (normalizedCarrier.includes('evri') || normalizedCarrier.includes('hermes')) carrierId = 20061;
+  else if (normalizedCarrier.includes('dpd')) carrierId = 20071;
+  else if (normalizedCarrier.includes('dhl')) carrierId = 20001;
 
   try {
     const apiKey = process.env.TRACK17_API_KEY;
@@ -123,10 +123,10 @@ app.post('/api/webhooks/fulfillment', async (req, res) => {
     const normalizedCarrier = rawCarrier.toLowerCase().replace(/[^a-z0-9]/g, '');
     let carrierId = null;
 
-    if (normalizedCarrier.includes('royalmail') || trackingNumber.toUpperCase().endsWith('GB')) carrierId = 3011;
-    else if (normalizedCarrier.includes('evri') || normalizedCarrier.includes('hermes')) carrierId = 10026;
-    else if (normalizedCarrier.includes('dpd')) carrierId = 10019;
-    else if (normalizedCarrier.includes('dhl')) carrierId = 10001;
+    if (normalizedCarrier.includes('royalmail') || trackingNumber.toUpperCase().endsWith('GB')) carrierId = 21041;
+    else if (normalizedCarrier.includes('evri') || normalizedCarrier.includes('hermes')) carrierId = 20061;
+    else if (normalizedCarrier.includes('dpd')) carrierId = 20071;
+    else if (normalizedCarrier.includes('dhl')) carrierId = 20001;
 
     const apiKey = process.env.TRACK17_API_KEY;
     const trackingPayload = [{ number: trackingNumber }];
