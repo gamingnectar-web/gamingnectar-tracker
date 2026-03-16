@@ -73,7 +73,7 @@ app.get('/api/track', async (req, res) => {
   else if (rawCarrier.includes('dhl')) carrierId = 10001;
 
   try {
-    const apiKey = process.env['17TRACK_API_KEY'];
+    const apiKey = process.env.TRACK17_API_KEY;
     if (!apiKey) throw new Error("Missing 17TRACK_API_KEY in environment variables.");
 
     const headers = {
