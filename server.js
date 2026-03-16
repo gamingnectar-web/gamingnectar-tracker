@@ -64,23 +64,23 @@ async function shopifyGraphQL(query, variables = {}) {
 //
 // Verified current examples from 17TRACK official carrier list:
 // Royal Mail  = 11033
-// Parcelforce = 11041
+// Parcelforce = 11031
 // DHL Express = 100001
-// UPS         = 100003
-// FedEx       = 100004
-// DPD         = 100011
-// EVRi        = 100332
+// UPS         = 100398
+// FedEx       = 100003
+// DPD         = 100010
+// EVRi        = 100331
 //
 // If carrier is unknown, omit `carrier` and let 17TRACK auto-detect.
 
 const TRACK17_CARRIER_CODES = {
   ROYAL_MAIL: 11033,
-  PARCELFORCE: 11041,
+  PARCELFORCE: 11031,
   DHL_EXPRESS: 100001,
-  UPS: 100003,
-  FEDEX: 100004,
-  DPD: 100011,
-  EVRI: 100332
+  UPS: 100398,
+  FEDEX: 100003,
+  DPD: 100010,
+  EVRI: 100331
 };
 
 function normalizeCarrierName(value = '') {
