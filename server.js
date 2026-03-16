@@ -42,10 +42,10 @@ async function shopifyGraphQL(query, variables = {}) {
 }
 
 // =====================================================================
-// 17TRACK HELPERS (VERIFIED CODES: RM=11031 | GB=1103)
+// 17TRACK HELPERS (VERIFIED RM=11031 | GB=1103)
 // =====================================================================
 const TRACK17_CARRIER_CODES = {
-  ROYAL_MAIL: 11031,   // ✅ VERIFIED
+  ROYAL_MAIL: 11031,   
   EVRI: 100331,
   DPD: 100010,
   DHL_EXPRESS: 100001,
@@ -57,7 +57,7 @@ function build17TrackPayload(trackingNumber, rawCarrier = '') {
   const cleanNumber = String(trackingNumber || '').trim();
   const normalized = String(rawCarrier).toLowerCase().replace(/[^a-z0-9]/g, '');
   
-  // 1103 is the destination country code for United Kingdom (ISO: GB)
+  // Base Item - 1103 is United Kingdom
   const item = { 
     number: cleanNumber,
     final_v2: 1103 
@@ -65,6 +65,7 @@ function build17TrackPayload(trackingNumber, rawCarrier = '') {
 
   let carrierId = null;
 
+  // Matching Logic
   if (normalized.includes('royalmail') || cleanNumber.toUpperCase().endsWith('GB')) {
     carrierId = TRACK17_CARRIER_CODES.ROYAL_MAIL;
   } else if (normalized.includes('evri') || normalized.includes('hermes')) {
@@ -75,14 +76,19 @@ function build17TrackPayload(trackingNumber, rawCarrier = '') {
     carrierId = TRACK17_CARRIER_CODES.DHL_EXPRESS;
   }
 
-  if (carrierId) item.carrier = carrierId;
+  // Ensure ID is passed as a Number for JSON protocol
+  if (carrierId) item.carrier = Number(carrierId);
+  
   return [item];
 }
 
 async function call17Track(endpoint, payload) {
   const response = await fetch(`https://api.17track.net/track/v2.4/${endpoint}`, {
     method: 'POST',
-    headers: { '17token': process.env.TRACK17_API_KEY, 'Content-Type': 'application/json' },
+    headers: { 
+        '17token': process.env.TRACK17_API_KEY, 
+        'Content-Type': 'application/json' 
+    },
     body: JSON.stringify(payload)
   });
   return response.json();
@@ -109,7 +115,7 @@ app.get('/api/track', async (req, res) => {
     if (!track || track.latest_status?.status === 'NotFound' || !track.tracking) {
       console.log(`Polling Royal Mail (11031) now for: ${number}`);
       await call17Track('retrack', payload);
-      await new Promise(r => setTimeout(r, 1500)); 
+      await new Promise(r => setTimeout(r, 2000)); // Increased wait for 17Track background sync
       info = await call17Track('gettrackinfo', payload);
       track = info.data?.accepted?.[0]?.track_info;
     }
@@ -147,8 +153,10 @@ app.post('/api/webhooks/fulfillment', async (req, res) => {
     if (!number) return;
 
     const payload = build17TrackPayload(number, tracking_company);
-    await call17Track('register', payload);
-    console.log(`✅ Auto-registered Royal Mail fulfillment: ${number}`);
+    const registerResponse = await call17Track('register', payload);
+    
+    console.log(`✅ Auto-registered Royal Mail: ${number}`);
+    console.log(`17Track Response:`, JSON.stringify(registerResponse));
   } catch (error) {
     console.error('🚨 Webhook Error:', error.message);
   }
