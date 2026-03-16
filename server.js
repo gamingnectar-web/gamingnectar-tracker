@@ -38,7 +38,6 @@ async function shopifyGraphQL(query, variables = {}) {
     const shopifyDomain = process.env.SHOPIFY_DOMAIN;
     const accessToken = await getShopifyToken();
     
-    // Using 2024-01 to match your existing code, but upgrade to 2026-01 when ready
     const response = await fetch(`https://${shopifyDomain}/admin/api/2024-01/graphql.json`, {
         method: 'POST',
         headers: { 
@@ -53,85 +52,91 @@ async function shopifyGraphQL(query, variables = {}) {
     return data;
 }
 
-// 1. TRACKING (Now with X-Ray Vision Logging & Note Field Fix!)
+// =====================================================================
+// 1. TRACKING (NOW POWERED BY EASYPOST 🚀)
+// =====================================================================
 app.get('/api/track', async (req, res) => {
   const trackingNumber = String(req.query.number || '').trim();
   const rawCarrier = String(req.query.carrier || '').toLowerCase();
-  const productId = req.query.product_id; 
 
-  console.log(`\n🔍 Received tracking request for: ${trackingNumber} | Product(s): ${productId || 'None'}`);
+  console.log(`\n🔍 Received EasyPost tracking request for: ${trackingNumber}`);
 
   if (trackingNumber === 'KEEP_ALIVE') return res.json({ status: 'AWAKE' });
   if (!trackingNumber) return res.status(400).json({ error: 'Missing tracking number' });
 
-  let courierCode = 'royal-mail';
-  if (rawCarrier.includes('evri') || rawCarrier.includes('hermes')) courierCode = 'evri';
-  else if (rawCarrier.includes('dpd')) courierCode = 'dpd-uk';
-  else if (rawCarrier.includes('dhl')) courierCode = 'dhl';
+  // Map to EasyPost specific Carrier strings
+  let courierCode = 'RoyalMail';
+  if (rawCarrier.includes('evri') || rawCarrier.includes('hermes')) courierCode = 'Evri';
+  else if (rawCarrier.includes('dpd')) courierCode = 'DPDUK';
+  else if (rawCarrier.includes('dhl')) courierCode = 'DHL';
 
   try {
-    const apiKey = process.env.TRACKINGMORE_API_KEY;
+    const apiKey = process.env.EASYPOST_API_KEY;
+    if (!apiKey) throw new Error("Missing EASYPOST_API_KEY in environment variables.");
+
+    // EasyPost uses Basic Auth with the API key as the username
+    const authHeader = 'Basic ' + Buffer.from(apiKey + ':').toString('base64');
     
-    // 1. Check if it exists
-    let getResponse = await fetch(`https://api.trackingmore.com/v4/trackings/get?tracking_numbers=${trackingNumber}`, {
-      method: 'GET',
-      headers: { 'Tracking-Api-Key': apiKey, 'Content-Type': 'application/json' }
+    // EasyPost is smart: If this tracker already exists, it returns the existing one 
+    // WITHOUT charging your quota again. 
+    let createRes = await fetch('https://api.easypost.com/v2/trackers', {
+      method: 'POST',
+      headers: { 'Authorization': authHeader, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tracker: { tracking_code: trackingNumber, carrier: courierCode }
+      })
     });
-    let data = await getResponse.json();
     
-    // 2. If it DOES NOT exist, create it
-    if (!data.data || data.data.length === 0) {
-        console.log(`📦 Tracking number not found in TrackingMore. Attempting to create...`);
-        
-        const createPayload = { 
-            tracking_number: trackingNumber, 
-            courier_code: courierCode 
-        };
-
-        if (productId) {
-            // 🚀 FIX: Use 'note' instead of 'custom_fields' to bypass strict formatting
-            createPayload.note = productId; 
-            console.log(`📎 Attaching Product ID(s) to payload (in note field): ${productId}`);
-        }
-
-        let createRes = await fetch('https://api.trackingmore.com/v4/trackings/create', {
+    let trackerData = await createRes.json();
+    
+    // Fallback: If EasyPost rejects our explicit carrier, try letting it auto-detect
+    if (trackerData.error && trackerData.error.message.includes('carrier')) {
+        console.log(`🔄 Retrying with EasyPost auto-detect for carrier...`);
+        let retryRes = await fetch('https://api.easypost.com/v2/trackers', {
           method: 'POST',
-          headers: { 'Tracking-Api-Key': apiKey, 'Content-Type': 'application/json' },
-          body: JSON.stringify(createPayload)
+          headers: { 'Authorization': authHeader, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tracker: { tracking_code: trackingNumber } })
         });
-        
-        let createData = await createRes.json();
-        
-        // LOG THE RESPONSE FROM TRACKINGMORE!
-        console.log(`📥 TrackingMore Creation Response:`, JSON.stringify(createData));
-
-        return res.json({ status: 'PENDING', history: [], debug: createData });
+        trackerData = await retryRes.json();
     }
 
-    // 3. If it DOES exist, process the history
-    console.log(`✅ Tracking number found in TrackingMore. Processing history...`);
-    let tmStatus = data.data[0].delivery_status || 'pending';
-    let trackHistory = data.data[0].origin_info?.trackinfo || data.data[0].trackinfo || [];
+    if (!trackerData.id) {
+        console.log(`📥 EasyPost Error/Pending Response:`, JSON.stringify(trackerData));
+        return res.json({ status: 'PENDING', history: [], debug: trackerData });
+    }
 
+    console.log(`✅ Tracker active in EasyPost. Status: ${trackerData.status}`);
+
+    // Map EasyPost status to your Frontend's expected status
     let currentStatus = 'IN_TRANSIT';
-    if (tmStatus === 'delivered') currentStatus = 'DELIVERED';
-    else if (['pickup', 'outfordelivery'].includes(tmStatus)) currentStatus = 'OUT_FOR_DELIVERY';
+    if (trackerData.status === 'delivered') currentStatus = 'DELIVERED';
+    else if (['out_for_delivery', 'available_for_pickup'].includes(trackerData.status)) currentStatus = 'OUT_FOR_DELIVERY';
 
-    return res.json({
-      status: currentStatus,
-      history: trackHistory.map(event => ({
-        date: event.checkpoint_date || event.Date || '', 
-        detail: event.tracking_detail || event.StatusDescription || 'Update received',
-        location: event.location || event.Details || ''
-      }))
-    });
+    let trackHistory = trackerData.tracking_details || [];
+
+    // Map history to match your frontend timeline and reverse it so newest is first
+    const formattedHistory = trackHistory.map(event => {
+      let locParts = [];
+      if (event.tracking_location?.city) locParts.push(event.tracking_location.city);
+      if (event.tracking_location?.state) locParts.push(event.tracking_location.state);
+      if (event.tracking_location?.country) locParts.push(event.tracking_location.country);
+
+      return {
+        date: event.datetime || '', 
+        detail: event.message || event.status || 'Update received',
+        location: locParts.join(', ')
+      };
+    }).reverse();
+
+    return res.json({ status: currentStatus, history: formattedHistory });
+
   } catch (error) {
     console.error(`🚨 Fatal Error in /api/track:`, error.message);
     return res.status(500).json({ error: 'Internal Error' });
   }
 });
 
-// 2. AI SYNC (Your original logic)
+// 2. AI SYNC 
 app.post('/api/update-ai', async (req, res) => {
   const { customer_id, ai_overview } = req.body;
   
@@ -174,30 +179,20 @@ app.post('/api/update-ai', async (req, res) => {
 // =====================================================================
 
 /*
-// HELPER: Add/Remove 'incoming' and 'restocked' tags
 async function updateProductStatus(productId, newTag) { ... }
-
-// HELPER: Generate 'Patience' Discount Code
 async function generateDiscountCode(poNumber) { ... }
 
 // 3. SUPPLY BACKEND WEBHOOK
 app.post('/api/webhooks/supply-update', async (req, res) => { ... });
 
-// 4. TRACKINGMORE WEBHOOK
+// 4. DELIVERY WEBHOOK (Previously TrackingMore)
 app.post('/api/webhooks/trackingmore-update', async (req, res) => { ... });
-
-// =====================================================================
-// 🕒 COMMENTED OUT: AUTO-POLLER
-// =====================================================================
 
 const processedPOs = new Set();
 async function pollShopifyPOs() { ... }
-
 // setInterval(pollShopifyPOs, 15 * 60 * 1000);
 // setTimeout(pollShopifyPOs, 5000);
 */
-
-// =====================================================================
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 API active on ${PORT}`));
