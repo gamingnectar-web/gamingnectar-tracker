@@ -59,17 +59,17 @@ async function callAfterShip(endpoint, method = 'GET', body = null) {
   const options = {
     method,
     headers: {
-      // 🚀 THE FIX: Modern AfterShip API Key Header
       'as-api-key': process.env.AFTERSHIP_API_KEY,
       'Content-Type': 'application/json'
     }
   };
   if (body) options.body = JSON.stringify(body);
 
-  const res = await fetch(`https://api.aftership.com/v4/${endpoint}`, options);
+  // 🚀 THE FIX: Modern AfterShip accounts require this endpoint format
+  const res = await fetch(`https://api.aftership.com/tracking/2024-01/${endpoint}`, options);
   const data = await res.json();
   
-  // 🚨 Built-in Error Logger: If AfterShip rejects it, we'll see exactly why in Render
+  // 🚨 Built-in Error Logger
   if (!res.ok || data.meta?.code >= 400) {
       console.log(`🚨 AfterShip API Error [${method} ${endpoint}]:`, JSON.stringify(data));
   }
@@ -88,7 +88,7 @@ app.get('/api/track', async (req, res) => {
   try {
     const slug = getAfterShipSlug(number, carrier);
 
-    // Step 1: Register the tracking (creates it if it doesn't exist)
+    // Step 1: Register the tracking
     await callAfterShip('trackings', 'POST', { 
       tracking: { tracking_number: number, slug: slug } 
     });
