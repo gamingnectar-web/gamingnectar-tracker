@@ -10,6 +10,7 @@ app.use(express.json());
 // =====================================================================
 async function getShopifyToken() {
   const { SHOPIFY_DOMAIN, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET } = process.env;
+
   if (!SHOPIFY_DOMAIN || !SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET) {
     throw new Error('Missing Shopify credentials in environment.');
   }
@@ -25,40 +26,58 @@ async function getShopifyToken() {
   });
 
   const data = await response.json();
-  if (data.access_token) return data.access_token;
-  throw new Error(`Shopify token generation failed: ${JSON.stringify(data)}`);
+
+  if (!response.ok || !data.access_token) {
+    throw new Error(`Shopify token generation failed: ${JSON.stringify(data)}`);
+  }
+
+  return data.access_token;
 }
 
 async function shopifyGraphQL(query, variables = {}) {
   const accessToken = await getShopifyToken();
+
   const response = await fetch(`https://${process.env.SHOPIFY_DOMAIN}/admin/api/2024-01/graphql.json`, {
     method: 'POST',
-    headers: { 
-      'Content-Type': 'application/json', 
-      'X-Shopify-Access-Token': accessToken 
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Shopify-Access-Token': accessToken
     },
     body: JSON.stringify({ query, variables })
   });
+
   const data = await response.json();
-  if (data.errors) throw new Error(JSON.stringify(data.errors));
+
+  if (!response.ok || data.errors) {
+    throw new Error(JSON.stringify(data.errors || data));
+  }
+
   return data;
 }
 
 // =====================================================================
-// 🛠️ AFTERSHIP HELPERS (LATEST 2026-01 API)
+// AFTERSHIP HELPERS
 // =====================================================================
-function getAfterShipSlug(trackingNumber, rawCarrier = '') {
-  const norm = String(rawCarrier).toLowerCase().replace(/[^a-z]/g, '');
-  const num = String(trackingNumber).toUpperCase();
+function normalizeCarrier(rawCarrier = '') {
+  return String(rawCarrier).toLowerCase().replace(/[^a-z0-9]/g, '');
+}
 
-  if (norm.includes('royalmail') || num.endsWith('GB')) return 'royal-mail';
+function getKnownAfterShipSlug(rawCarrier = '') {
+  const norm = normalizeCarrier(rawCarrier);
+
+  if (norm.includes('royalmail')) return 'royal-mail';
   if (norm.includes('evri') || norm.includes('hermes')) return 'evri';
   if (norm.includes('dpd')) return 'dpd-uk';
   if (norm.includes('dhl')) return 'dhl';
-  return 'royal-mail'; 
+
+  return null;
 }
 
 async function callAfterShip(endpoint, method = 'GET', body = null) {
+  if (!process.env.AFTERSHIP_API_KEY) {
+    throw new Error('Missing AFTERSHIP_API_KEY in environment.');
+  }
+
   const options = {
     method,
     headers: {
@@ -66,21 +85,110 @@ async function callAfterShip(endpoint, method = 'GET', body = null) {
       'Content-Type': 'application/json'
     }
   };
-  
+
   if (body) {
     options.body = JSON.stringify(body);
   }
 
-  // 🚀 THE FIX: We are now using the absolute newest 2026-01 endpoint
   const res = await fetch(`https://api.aftership.com/tracking/2026-01/${endpoint}`, options);
-  const data = await res.json();
-  
-  // 🚨 Built-in Error Logger
-  if (!res.ok || data.meta?.code >= 400) {
-      console.log(`🚨 AfterShip API Error [${method} ${endpoint}]:`, JSON.stringify(data));
+
+  let data;
+  try {
+    data = await res.json();
+  } catch (err) {
+    throw new Error(`AfterShip returned non-JSON response for ${method} ${endpoint}`);
   }
-  
+
+  if (!res.ok || (data.meta && data.meta.code >= 400)) {
+    console.log(`🚨 AfterShip API Error [${method} ${endpoint}]:`, JSON.stringify(data));
+  }
+
   return data;
+}
+
+async function detectAfterShipSlug(trackingNumber) {
+  const result = await callAfterShip('couriers/detect', 'POST', {
+    tracking_number: trackingNumber
+  });
+
+  const detected = result?.data?.couriers?.[0]?.slug || null;
+
+  if (detected) {
+    console.log(`🔎 Detected courier for ${trackingNumber}: ${detected}`);
+  } else {
+    console.log(`⚠️ No courier detected for ${trackingNumber}`);
+  }
+
+  return detected;
+}
+
+async function createAfterShipTracking(trackingNumber, rawCarrier = '') {
+  const cleanNumber = String(trackingNumber).trim();
+
+  let slug = getKnownAfterShipSlug(rawCarrier);
+
+  if (!slug) {
+    slug = await detectAfterShipSlug(cleanNumber);
+  }
+
+  const payload = { tracking_number: cleanNumber };
+  if (slug) payload.slug = slug;
+
+  const result = await callAfterShip('trackings', 'POST', payload);
+  const code = result?.meta?.code;
+
+  // 201 / 200 = success
+  // 4003 = already exists
+  if (code === 201 || code === 200 || code === 4003) {
+    return { ok: true, slug, result };
+  }
+
+  return {
+    ok: false,
+    slug,
+    result,
+    error: result?.meta?.message || 'AfterShip tracking creation failed'
+  };
+}
+
+async function fetchAfterShipTracking(trackingNumber, rawCarrier = '') {
+  const cleanNumber = String(trackingNumber).trim();
+
+  let slug = getKnownAfterShipSlug(rawCarrier);
+
+  if (!slug) {
+    slug = await detectAfterShipSlug(cleanNumber);
+  }
+
+  const query = new URLSearchParams({ tracking_numbers: cleanNumber });
+  if (slug) query.set('slug', slug);
+
+  const result = await callAfterShip(`trackings?${query.toString()}`, 'GET');
+  const track = result?.data?.trackings?.[0] || null;
+
+  return { slug, track, raw: result };
+}
+
+function mapTrackingStatus(tag = '') {
+  const value = String(tag).toLowerCase();
+
+  if (value === 'delivered') return 'DELIVERED';
+  if (value === 'exception' || value === 'failed_attempt') return 'EXCEPTION';
+  if (value === 'pending' || value === 'info_received') return 'PENDING';
+  if (value === 'expired') return 'EXPIRED';
+  if (value === 'available_for_pickup') return 'READY_FOR_PICKUP';
+
+  return 'IN_TRANSIT';
+}
+
+function formatTrackingHistory(track) {
+  return (track?.checkpoints || [])
+    .map((cp) => ({
+      date: cp.checkpoint_time || cp.created_at || null,
+      detail: cp.message || cp.tag || '',
+      location: cp.location || ''
+    }))
+    .reverse();
 }
 
 // =====================================================================
@@ -88,39 +196,49 @@ async function callAfterShip(endpoint, method = 'GET', body = null) {
 // =====================================================================
 app.get('/api/track', async (req, res) => {
   const { number, carrier } = req.query;
-  if (number === 'KEEP_ALIVE') return res.json({ status: 'AWAKE' });
-  if (!number) return res.status(400).json({ error: 'Missing number' });
+
+  if (number === 'KEEP_ALIVE') {
+    return res.json({ status: 'AWAKE' });
+  }
+
+  if (!number) {
+    return res.status(400).json({ error: 'Missing number' });
+  }
 
   try {
     const cleanNumber = String(number).trim();
-    const slug = getAfterShipSlug(cleanNumber, carrier);
 
-    // Step 1: Register the tracking (Flat body required by 2026 API)
-    await callAfterShip('trackings', 'POST', { 
-      tracking_number: cleanNumber, 
-      slug: slug 
-    });
+    // Try to register first
+    const created = await createAfterShipTracking(cleanNumber, carrier);
 
-    // Step 2: Get the status (Search by tracking number to guarantee we find it)
-    const data = await callAfterShip(`trackings?tracking_numbers=${cleanNumber}`);
-    
-    // The new 2026 search returns an array of trackings
-    const track = data.data?.trackings?.[0];
+    // If create failed for a real reason, continue to fetch anyway only if you want
+    // Here we hard-fail because bad slug/data should be visible
+    if (!created.ok) {
+      throw new Error(created.error || 'AfterShip create failed');
+    }
 
-    // If AfterShip is still syncing it in the background, return PENDING
-    if (!track) return res.json({ status: 'PENDING', history: [] });
+    // Then fetch tracking
+    const fetched = await fetchAfterShipTracking(cleanNumber, carrier);
+    const track = fetched.track;
+
+    if (!track) {
+      return res.json({
+        status: 'PENDING',
+        history: [],
+        slug: fetched.slug || created.slug || null
+      });
+    }
 
     return res.json({
-      status: track.tag === 'Delivered' ? 'DELIVERED' : 'IN_TRANSIT',
-      history: (track.checkpoints || []).map(cp => ({
-        date: cp.checkpoint_time,
-        detail: cp.message,
-        location: cp.location || ''
-      })).reverse() // Ensures newest updates are usually at the top
+      status: mapTrackingStatus(track.tag),
+      tag: track.tag || null,
+      slug: fetched.slug || created.slug || null,
+      tracking_number: track.tracking_number || cleanNumber,
+      history: formatTrackingHistory(track)
     });
   } catch (e) {
     console.error('🚨 Hub Error:', e.message);
-    res.status(500).json({ error: 'Tracking unavailable' });
+    return res.status(500).json({ error: 'Tracking unavailable' });
   }
 });
 
@@ -129,52 +247,78 @@ app.get('/api/track', async (req, res) => {
 // =====================================================================
 app.post('/api/webhooks/fulfillment', async (req, res) => {
   res.status(200).send('OK');
+
   try {
     const { tracking_number, tracking_numbers, tracking_company } = req.body;
-    let num = tracking_number || (tracking_numbers ? tracking_numbers[0] : null);
+
+    let num = tracking_number || (Array.isArray(tracking_numbers) ? tracking_numbers[0] : null);
     if (!num) return;
-    
+
     num = String(num).trim();
-    const slug = getAfterShipSlug(num, tracking_company);
-    
-    const result = await callAfterShip('trackings', 'POST', { 
-      tracking_number: num, 
-      slug: slug 
-    });
-    
-    // Log success, or ignore if it already exists (Code 4003)
-    if (result.meta?.code === 201 || result.meta?.code === 200 || result.meta?.code === 4003) {
-        console.log(`✅ Auto-Registered AfterShip: ${num}`);
+
+    const created = await createAfterShipTracking(num, tracking_company);
+
+    if (created.ok) {
+      console.log(`✅ Auto-Registered AfterShip: ${num}${created.slug ? ` (${created.slug})` : ''}`);
+    } else {
+      console.log(`⚠️ AfterShip registration skipped/failed for ${num}: ${created.error}`);
     }
-  } catch (e) { 
-      console.error('🚨 Webhook Error:', e.message); 
+  } catch (e) {
+    console.error('🚨 Webhook Error:', e.message);
   }
 });
 
 // =====================================================================
-// 3. AI PROFILE SYNC (MAINTAINED)
+// 3. AI PROFILE SYNC
 // =====================================================================
 app.post('/api/update-ai', async (req, res) => {
   const { customer_id, ai_overview } = req.body;
-  if (!customer_id) return res.status(400).json({ error: 'Missing ID' });
+
+  if (!customer_id) {
+    return res.status(400).json({ error: 'Missing ID' });
+  }
 
   try {
-    const ownerId = customer_id.includes('gid://') ? customer_id : `gid://shopify/Customer/${customer_id}`;
-    const query = `mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
-      metafieldsSet(metafields: $metafields) {
-        metafields { id }
-        userErrors { field message }
-      }
-    }`;
-    const variables = { metafields: [{ ownerId, namespace: 'custom', key: 'ai_overview', type: 'multi_line_text_field', value: ai_overview }] };
+    const ownerId = customer_id.includes('gid://')
+      ? customer_id
+      : `gid://shopify/Customer/${customer_id}`;
 
-    await shopifyGraphQL(query, variables);
-    res.json({ success: true });
+    const query = `
+      mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+        metafieldsSet(metafields: $metafields) {
+          metafields { id }
+          userErrors { field message }
+        }
+      }
+    `;
+
+    const variables = {
+      metafields: [
+        {
+          ownerId,
+          namespace: 'custom',
+          key: 'ai_overview',
+          type: 'multi_line_text_field',
+          value: ai_overview || ''
+        }
+      ]
+    };
+
+    const result = await shopifyGraphQL(query, variables);
+    const userErrors = result?.data?.metafieldsSet?.userErrors || [];
+
+    if (userErrors.length) {
+      return res.status(400).json({ error: userErrors });
+    }
+
+    return res.json({ success: true });
   } catch (error) {
     console.error('🚨 AI Sync Failed:', error.message);
-    res.status(500).json({ error: 'Sync Failed' });
+    return res.status(500).json({ error: 'Sync Failed' });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 AfterShip Hub active on ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 AfterShip Hub active on ${PORT}`);
+});
