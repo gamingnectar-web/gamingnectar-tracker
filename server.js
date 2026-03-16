@@ -33,7 +33,10 @@ async function shopifyGraphQL(query, variables = {}) {
   const accessToken = await getShopifyToken();
   const response = await fetch(`https://${process.env.SHOPIFY_DOMAIN}/admin/api/2024-01/graphql.json`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': accessToken },
+    headers: { 
+      'Content-Type': 'application/json', 
+      'X-Shopify-Access-Token': accessToken 
+    },
     body: JSON.stringify({ query, variables })
   });
   const data = await response.json();
@@ -60,14 +63,19 @@ async function callAfterShip(endpoint, method = 'GET', body = null) {
     method,
     headers: {
       'as-api-key': process.env.AFTERSHIP_API_KEY,
+      'as-api-version': '2024-01', // 🚀 THE FIX: Force the API gateway to parse the versioned JSON
       'Content-Type': 'application/json'
     }
   };
-  if (body) options.body = JSON.stringify(body);
+  
+  if (body) {
+    options.body = JSON.stringify(body);
+  }
 
   const res = await fetch(`https://api.aftership.com/tracking/2024-01/${endpoint}`, options);
   const data = await res.json();
   
+  // 🚨 Built-in Error Logger
   if (!res.ok || data.meta?.code >= 400) {
       console.log(`🚨 AfterShip API Error [${method} ${endpoint}]:`, JSON.stringify(data));
   }
@@ -84,18 +92,22 @@ app.get('/api/track', async (req, res) => {
   if (!number) return res.status(400).json({ error: 'Missing number' });
 
   try {
-    const slug = getAfterShipSlug(number, carrier);
+    const cleanNumber = String(number).trim();
+    const slug = getAfterShipSlug(cleanNumber, carrier);
 
-    // 🚀 THE FIX: Removed the nested "tracking" wrapper to match 2024-01 spec
+    // Step 1: Register the tracking (with strict envelope)
     await callAfterShip('trackings', 'POST', { 
-      tracking_number: number, 
-      slug: slug 
+      tracking: { 
+        tracking_number: cleanNumber, 
+        slug: slug 
+      } 
     });
 
     // Step 2: Get the status
-    const data = await callAfterShip(`trackings/${slug}/${number}`);
+    const data = await callAfterShip(`trackings/${slug}/${cleanNumber}`);
     const track = data.data?.tracking;
 
+    // If AfterShip is still syncing it in the background, return PENDING
     if (!track) return res.json({ status: 'PENDING', history: [] });
 
     return res.json({
@@ -119,18 +131,21 @@ app.post('/api/webhooks/fulfillment', async (req, res) => {
   res.status(200).send('OK');
   try {
     const { tracking_number, tracking_numbers, tracking_company } = req.body;
-    const num = tracking_number || (tracking_numbers ? tracking_numbers[0] : null);
+    let num = tracking_number || (tracking_numbers ? tracking_numbers[0] : null);
     if (!num) return;
-
+    
+    num = String(num).trim();
     const slug = getAfterShipSlug(num, tracking_company);
     
-    // 🚀 THE FIX: Removed the nested "tracking" wrapper here too
     const result = await callAfterShip('trackings', 'POST', { 
-      tracking_number: num, 
-      slug: slug 
+      tracking: { 
+        tracking_number: num, 
+        slug: slug 
+      } 
     });
     
-    if (result.meta?.code === 201 || result.meta?.code === 200) {
+    // Log success, or ignore if it already exists (Code 4003)
+    if (result.meta?.code === 201 || result.meta?.code === 200 || result.meta?.code === 4003) {
         console.log(`✅ Auto-Registered AfterShip: ${num}`);
     }
   } catch (e) { 
