@@ -170,190 +170,32 @@ app.post('/api/update-ai', async (req, res) => {
 });
 
 // =====================================================================
-// 📦 NEW: SUPPLY CHAIN & INVENTORY LOGIC
+// 📦 COMMENTED OUT: SUPPLY CHAIN, INVENTORY LOGIC & WEBHOOKS
 // =====================================================================
 
+/*
 // HELPER: Add/Remove 'incoming' and 'restocked' tags
-async function updateProductStatus(productId, newTag) {
-    const query = `
-        mutation updateProduct($input: ProductInput!) {
-            productUpdate(input: $input) {
-                product { id tags }
-                userErrors { field message }
-            }
-        }
-    `;
-    const input = {
-        id: productId,
-        tags: [newTag] 
-    };
-    const result = await shopifyGraphQL(query, { input });
-    if (result.data?.productUpdate?.userErrors?.length > 0) {
-        throw new Error(JSON.stringify(result.data.productUpdate.userErrors));
-    }
-    return result;
-}
+async function updateProductStatus(productId, newTag) { ... }
 
 // HELPER: Generate 'Patience' Discount Code
-async function generateDiscountCode(poNumber) {
-    const codeName = `DELAY-${poNumber}-${Math.floor(Math.random() * 1000)}`;
-    const query = `
-        mutation discountCodeBasicCreate($basicCodeDiscount: DiscountCodeBasicInput!) {
-            discountCodeBasicCreate(basicCodeDiscount: $basicCodeDiscount) {
-                codeDiscountNode { id codeDiscount { ... on DiscountCodeBasic { codes(first: 1) { nodes { code } } } } }
-                userErrors { field message }
-            }
-        }
-    `;
-    const variables = {
-        basicCodeDiscount: {
-            title: `Apology Discount for PO ${poNumber}`,
-            code: codeName,
-            startsAt: new Date().toISOString(),
-            customerSelection: { all: true },
-            customerGets: { value: { percentage: 0.10 }, items: { all: true } },
-            appliesOncePerCustomer: true
-        }
-    };
-    
-    await shopifyGraphQL(query, variables);
-    return codeName;
-}
+async function generateDiscountCode(poNumber) { ... }
 
-// 3. SUPPLY BACKEND WEBHOOK (Kept active just in case you ever need it!)
-app.post('/api/webhooks/supply-update', async (req, res) => {
-    if (req.headers['x-supply-secret'] !== process.env.SUPPLY_WEBHOOK_SECRET) {
-        return res.status(403).json({ error: 'Unauthorized' });
-    }
+// 3. SUPPLY BACKEND WEBHOOK
+app.post('/api/webhooks/supply-update', async (req, res) => { ... });
 
-    const { event, po_number, items } = req.body;
-    console.log(`\n📦 Received supply event: ${event} for PO: ${po_number}`);
-
-    try {
-        if (event === 'PO_CREATED') {
-            for (let item of items) {
-                await updateProductStatus(item.shopify_product_id, 'incoming');
-                console.log(`✅ Tagged ${item.shopify_product_id} as incoming`);
-            }
-        } 
-        else if (event === 'PO_DELAYED') {
-            const discountCode = await generateDiscountCode(po_number);
-            console.log(`🎟️ Created apology discount code: ${discountCode}`);
-        }
-        
-        res.status(200).json({ success: true });
-    } catch (error) {
-        console.error('🚨 Supply Webhook Error:', error.message);
-        res.status(500).json({ error: 'Internal Server Error' });
-    }
-});
-
-// 4. TRACKINGMORE WEBHOOK (Triggers when status changes to 'Delivered')
-app.post('/api/webhooks/trackingmore-update', async (req, res) => {
-    const trackingData = req.body;
-    const currentStatus = trackingData.data?.delivery_status || trackingData.status;
-    
-    console.log(`\n🚚 TrackingMore Webhook Fired! Package: ${trackingData.data?.tracking_number || trackingData.tracking_number} is now ${currentStatus}`);
-
-    if (currentStatus === 'delivered') {
-        try {
-            // 🚀 FIX: Grab the Product IDs string from the 'note' field
-            const productIdsString = trackingData.data?.note || trackingData.note; 
-            
-            if (productIdsString) {
-                // Split them up in case there are multiple items in the box (e.g., "id1,id2,id3")
-                const productIds = productIdsString.split(',');
-
-                for (let id of productIds) {
-                    const cleanId = id.trim();
-                    if (cleanId) {
-                        await updateProductStatus(cleanId, 'restocked');
-                        console.log(`✅ Item delivered! Tagged ${cleanId} as restocked.`);
-                    }
-                }
-            } else {
-                console.log(`⚠️ Delivered, but no Product ID found in the note field.`);
-            }
-        } catch (error) {
-            console.error('🚨 TrackingMore Webhook Error:', error.message);
-        }
-    }
-    
-    res.status(200).send('OK'); 
-});
+// 4. TRACKINGMORE WEBHOOK
+app.post('/api/webhooks/trackingmore-update', async (req, res) => { ... });
 
 // =====================================================================
-// 🕒 NEW: AUTO-POLLER (Bypasses Shopify Flow Paywall)
+// 🕒 COMMENTED OUT: AUTO-POLLER
 // =====================================================================
 
-// We keep a temporary memory of POs we've seen so we don't spam your logs
 const processedPOs = new Set();
+async function pollShopifyPOs() { ... }
 
-async function pollShopifyPOs() {
-    console.log("🕵️ Polling Shopify for new Purchase Orders...");
-    try {
-        // Ask Shopify for the 10 most recently updated POs that are currently 'ORDERED'
-        const query = `
-            {
-                purchaseOrders(first: 10, query: "status:ORDERED", sortKey: UPDATED_AT, reverse: true) {
-                    edges {
-                        node {
-                            id
-                            name
-                            lineItems(first: 50) {
-                                edges {
-                                    node {
-                                        variant {
-                                            product {
-                                                id
-                                                tags
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        `;
-        
-        const response = await shopifyGraphQL(query);
-        const pos = response.data?.purchaseOrders?.edges || [];
-
-        for (let poEdge of pos) {
-            const po = poEdge.node;
-            
-            // Skip if we already processed this PO since the server started
-            if (processedPOs.has(po.id)) continue;
-
-            console.log(`📦 Found new active PO: ${po.name}`);
-            
-            const items = po.lineItems.edges;
-            for (let itemEdge of items) {
-                const product = itemEdge.node.variant?.product;
-                if (!product) continue; // Skip if the line item somehow has no product
-                
-                // Smart Check: Only update if it doesn't already have the tag!
-                if (!product.tags.includes('incoming')) {
-                    await updateProductStatus(product.id, 'incoming');
-                    console.log(`✅ Auto-Poller tagged ${product.id} as incoming (from ${po.name})`);
-                }
-            }
-            
-            // Add to our memory so we don't check it again next loop
-            processedPOs.add(po.id);
-        }
-    } catch (error) {
-        console.error("🚨 Poller Error:", error.message);
-    }
-}
-
-// ⏱️ Run the poller every 15 minutes (900,000 milliseconds)
-setInterval(pollShopifyPOs, 15 * 60 * 1000);
-
-// 🚀 Run it once immediately 5 seconds after the server boots up
-setTimeout(pollShopifyPOs, 5000);
+// setInterval(pollShopifyPOs, 15 * 60 * 1000);
+// setTimeout(pollShopifyPOs, 5000);
+*/
 
 // =====================================================================
 
