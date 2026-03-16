@@ -65,11 +65,9 @@ async function callAfterShip(endpoint, method = 'GET', body = null) {
   };
   if (body) options.body = JSON.stringify(body);
 
-  // 🚀 THE FIX: Modern AfterShip accounts require this endpoint format
   const res = await fetch(`https://api.aftership.com/tracking/2024-01/${endpoint}`, options);
   const data = await res.json();
   
-  // 🚨 Built-in Error Logger
   if (!res.ok || data.meta?.code >= 400) {
       console.log(`🚨 AfterShip API Error [${method} ${endpoint}]:`, JSON.stringify(data));
   }
@@ -88,9 +86,10 @@ app.get('/api/track', async (req, res) => {
   try {
     const slug = getAfterShipSlug(number, carrier);
 
-    // Step 1: Register the tracking
+    // 🚀 THE FIX: Removed the nested "tracking" wrapper to match 2024-01 spec
     await callAfterShip('trackings', 'POST', { 
-      tracking: { tracking_number: number, slug: slug } 
+      tracking_number: number, 
+      slug: slug 
     });
 
     // Step 2: Get the status
@@ -124,8 +123,11 @@ app.post('/api/webhooks/fulfillment', async (req, res) => {
     if (!num) return;
 
     const slug = getAfterShipSlug(num, tracking_company);
+    
+    // 🚀 THE FIX: Removed the nested "tracking" wrapper here too
     const result = await callAfterShip('trackings', 'POST', { 
-      tracking: { tracking_number: num, slug: slug } 
+      tracking_number: num, 
+      slug: slug 
     });
     
     if (result.meta?.code === 201 || result.meta?.code === 200) {
