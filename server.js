@@ -45,7 +45,7 @@ async function shopifyGraphQL(query, variables = {}) {
 }
 
 // =====================================================================
-// 🛠️ AFTERSHIP HELPERS (STABLE UK TRACKING)
+// 🛠️ AFTERSHIP HELPERS (LATEST 2026-01 API)
 // =====================================================================
 function getAfterShipSlug(trackingNumber, rawCarrier = '') {
   const norm = String(rawCarrier).toLowerCase().replace(/[^a-z]/g, '');
@@ -55,7 +55,7 @@ function getAfterShipSlug(trackingNumber, rawCarrier = '') {
   if (norm.includes('evri') || norm.includes('hermes')) return 'evri';
   if (norm.includes('dpd')) return 'dpd-uk';
   if (norm.includes('dhl')) return 'dhl';
-  return 'royal-mail'; // Default fallback
+  return 'royal-mail'; 
 }
 
 async function callAfterShip(endpoint, method = 'GET', body = null) {
@@ -63,7 +63,6 @@ async function callAfterShip(endpoint, method = 'GET', body = null) {
     method,
     headers: {
       'as-api-key': process.env.AFTERSHIP_API_KEY,
-      'as-api-version': '2024-01', // 🚀 THE FIX: Force the API gateway to parse the versioned JSON
       'Content-Type': 'application/json'
     }
   };
@@ -72,7 +71,8 @@ async function callAfterShip(endpoint, method = 'GET', body = null) {
     options.body = JSON.stringify(body);
   }
 
-  const res = await fetch(`https://api.aftership.com/tracking/2024-01/${endpoint}`, options);
+  // 🚀 THE FIX: We are now using the absolute newest 2026-01 endpoint
+  const res = await fetch(`https://api.aftership.com/tracking/2026-01/${endpoint}`, options);
   const data = await res.json();
   
   // 🚨 Built-in Error Logger
@@ -95,17 +95,17 @@ app.get('/api/track', async (req, res) => {
     const cleanNumber = String(number).trim();
     const slug = getAfterShipSlug(cleanNumber, carrier);
 
-    // Step 1: Register the tracking (with strict envelope)
+    // Step 1: Register the tracking (Flat body required by 2026 API)
     await callAfterShip('trackings', 'POST', { 
-      tracking: { 
-        tracking_number: cleanNumber, 
-        slug: slug 
-      } 
+      tracking_number: cleanNumber, 
+      slug: slug 
     });
 
-    // Step 2: Get the status
-    const data = await callAfterShip(`trackings/${slug}/${cleanNumber}`);
-    const track = data.data?.tracking;
+    // Step 2: Get the status (Search by tracking number to guarantee we find it)
+    const data = await callAfterShip(`trackings?tracking_numbers=${cleanNumber}`);
+    
+    // The new 2026 search returns an array of trackings
+    const track = data.data?.trackings?.[0];
 
     // If AfterShip is still syncing it in the background, return PENDING
     if (!track) return res.json({ status: 'PENDING', history: [] });
@@ -138,10 +138,8 @@ app.post('/api/webhooks/fulfillment', async (req, res) => {
     const slug = getAfterShipSlug(num, tracking_company);
     
     const result = await callAfterShip('trackings', 'POST', { 
-      tracking: { 
-        tracking_number: num, 
-        slug: slug 
-      } 
+      tracking_number: num, 
+      slug: slug 
     });
     
     // Log success, or ignore if it already exists (Code 4003)
