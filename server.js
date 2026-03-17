@@ -6,7 +6,8 @@ app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // =====================================================================
-// SHOPIFY HELPERS
+// OPTIONAL SHOPIFY HELPERS
+// Keep these only if your /api/update-ai route already works with them.
 // =====================================================================
 async function getShopifyToken() {
   const { SHOPIFY_DOMAIN, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET } = process.env;
@@ -31,132 +32,398 @@ async function getShopifyToken() {
 
 async function shopifyGraphQL(query, variables = {}) {
   const accessToken = await getShopifyToken();
-  const response = await fetch(`https://${process.env.SHOPIFY_DOMAIN}/admin/api/2024-01/graphql.json`, {
-    method: 'POST',
-    headers: { 
-      'Content-Type': 'application/json', 
-      'X-Shopify-Access-Token': accessToken 
-    },
-    body: JSON.stringify({ query, variables })
-  });
+
+  const response = await fetch(
+    `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2024-01/graphql.json`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': accessToken
+      },
+      body: JSON.stringify({ query, variables })
+    }
+  );
+
   const data = await response.json();
   if (data.errors) throw new Error(JSON.stringify(data.errors));
   return data;
 }
 
 // =====================================================================
-// 🛠️ AFTERSHIP HELPERS (STABLE 2024-01 AUTO-DETECT)
+// TRACK123 HELPERS
+// Track123 Shopify endpoint:
+// GET https://shp.track123.com/shopify/api/v1/{uuid}/orders/{orderId}.json
+// Auth header: X-Api-Key
 // =====================================================================
-async function callAfterShip(endpoint, method = 'GET', body = null) {
-  const options = {
-    method,
-    headers: {
-      'as-api-key': process.env.AFTERSHIP_API_KEY,
-      'as-api-version': '2024-01',
-      'Content-Type': 'application/json'
-    }
-  };
-  
-  if (body) {
-    options.body = JSON.stringify(body);
+async function callTrack123ShopifyOrder(orderId) {
+  const { TRACK123_STORE_UUID, TRACK123_API_KEY } = process.env;
+
+  if (!TRACK123_STORE_UUID || !TRACK123_API_KEY) {
+    throw new Error('Missing Track123 credentials in environment.');
   }
 
-  const res = await fetch(`https://api.aftership.com/tracking/2024-01/${endpoint}`, options);
-  const data = await res.json();
-  
-  if (!res.ok || data.meta?.code >= 400) {
-      console.log(`🚨 AfterShip API Error [${method} ${endpoint}]:`, JSON.stringify(data));
+  const endpoint = `https://shp.track123.com/shopify/api/v1/${TRACK123_STORE_UUID}/orders/${orderId}.json`;
+
+  const res = await fetch(endpoint, {
+    method: 'GET',
+    headers: {
+      'X-Api-Key': TRACK123_API_KEY,
+      'Accept': 'application/json'
+    }
+  });
+
+  const text = await res.text();
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Track123 returned non-JSON response: ${text}`);
   }
-  
+
+  if (!res.ok) {
+    throw new Error(`Track123 Shopify API failed [${res.status}]: ${JSON.stringify(data)}`);
+  }
+
+  return data;
+}
+
+// Optional direct tracking API fallback.
+// Track123 docs also expose tracking API flows for registering and querying trackings. :contentReference[oaicite:2]{index=2}
+async function callTrack123Tracking(endpoint, body) {
+  const { TRACK123_API_KEY } = process.env;
+
+  if (!TRACK123_API_KEY) {
+    throw new Error('Missing Track123 API key in environment.');
+  }
+
+  const res = await fetch(`https://api.track123.com${endpoint}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Track123-Api-Key': TRACK123_API_KEY,
+      'Accept': 'application/json'
+    },
+    body: JSON.stringify(body)
+  });
+
+  const text = await res.text();
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Track123 returned non-JSON response: ${text}`);
+  }
+
+  if (!res.ok) {
+    throw new Error(`Track123 Tracking API failed [${res.status}]: ${JSON.stringify(data)}`);
+  }
+
   return data;
 }
 
 // =====================================================================
-// 1. TRACKING API (FOR YOUR HUB)
+// HELPERS
+// =====================================================================
+function normalizeTrack123OrderResponse(raw) {
+  const order = raw?.order || raw || {};
+  const fulfillments = Array.isArray(order.fulfillments) ? order.fulfillments : [];
+  const fulfillment = fulfillments[0] || null;
+
+  if (!fulfillment) {
+    return {
+      found: false,
+      status: 'UNAVAILABLE',
+      history: [],
+      order: {
+        order_id: order.order_id || null,
+        order_name: order.order_name || null
+      },
+      fulfillment: null
+    };
+  }
+
+  const trackingDetails = Array.isArray(fulfillment.tracking_details)
+    ? fulfillment.tracking_details
+    : [];
+
+  const transitStatus = String(fulfillment.transit_status || '').toLowerCase();
+
+  let status = 'IN_TRANSIT';
+  if (transitStatus.includes('delivered')) status = 'DELIVERED';
+  else if (transitStatus.includes('exception')) status = 'ISSUE';
+  else if (transitStatus.includes('pending')) status = 'PENDING';
+  else if (transitStatus.includes('info')) status = 'PENDING';
+
+  return {
+    found: true,
+    status,
+    history: trackingDetails.map(item => ({
+      date: item.event_time || item.event_time_utc || '',
+      detail: item.event_detail || item.status || '',
+      location: item.event_location || ''
+    })),
+    order: {
+      order_id: order.order_id || null,
+      order_name: order.order_name || null,
+      order_status: order.status || ''
+    },
+    fulfillment: {
+      id: fulfillment.id || null,
+      tracking_number: fulfillment.tracking_number || '',
+      tracking_company: fulfillment.tracking_company || fulfillment.courier?.name || '',
+      carrier_code: fulfillment.carrier_code || '',
+      transit_status: fulfillment.transit_status || '',
+      transit_sub_status: fulfillment.transit_sub_status || '',
+      last_event: fulfillment.last_event || '',
+      last_event_time: fulfillment.last_event_time || '',
+      tracking_link:
+        fulfillment.courier?.query_link ||
+        order.tracking_link ||
+        ''
+    }
+  };
+}
+
+// Try to derive a better public tracking URL for carriers you care about.
+function buildPublicTrackingUrl(carrier, trackingNumber, fallbackUrl = '') {
+  const c = String(carrier || '').toLowerCase();
+  const n = String(trackingNumber || '').trim();
+  if (!n) return fallbackUrl || '';
+
+  if (c.includes('royal mail')) {
+    return `https://www.royalmail.com/track-your-item#/tracking-results/${encodeURIComponent(n)}`;
+  }
+  if (c.includes('evri') || c.includes('hermes')) {
+    return `https://www.evri.com/track-a-parcel/tracking-details?trackingId=${encodeURIComponent(n)}`;
+  }
+
+  return fallbackUrl || '';
+}
+
+// =====================================================================
+// 1. ORDER-BASED TRACKING API (BEST FOR YOUR HUB)
+// Example:
+// GET /api/order-tracking?order_id=1234567890
+// =====================================================================
+app.get('/api/order-tracking', async (req, res) => {
+  const { order_id } = req.query;
+
+  if (order_id === 'KEEP_ALIVE') {
+    return res.json({ status: 'AWAKE' });
+  }
+
+  if (!order_id) {
+    return res.status(400).json({ error: 'Missing order_id' });
+  }
+
+  try {
+    const raw = await callTrack123ShopifyOrder(String(order_id).trim());
+    const normalized = normalizeTrack123OrderResponse(raw);
+
+    if (normalized.fulfillment) {
+      normalized.fulfillment.tracking_link = buildPublicTrackingUrl(
+        normalized.fulfillment.tracking_company,
+        normalized.fulfillment.tracking_number,
+        normalized.fulfillment.tracking_link
+      );
+    }
+
+    return res.json(normalized);
+  } catch (e) {
+    console.error('🚨 Order Tracking Error:', e.message);
+    return res.status(500).json({
+      error: 'Order tracking unavailable',
+      message: e.message
+    });
+  }
+});
+
+// =====================================================================
+// 2. LEGACY TRACKING ROUTE
+// Keeps your storefront compatible if it already calls /api/track
+//
+// Preferred new usage:
+//   /api/order-tracking?order_id=...
+//
+// Temporary fallback:
+//   /api/track?number=...
 // =====================================================================
 app.get('/api/track', async (req, res) => {
-  const { number } = req.query;
-  if (number === 'KEEP_ALIVE') return res.json({ status: 'AWAKE' });
-  if (!number) return res.status(400).json({ error: 'Missing number' });
+  const { number, order_id, carrier } = req.query;
+
+  if (number === 'KEEP_ALIVE' || order_id === 'KEEP_ALIVE') {
+    return res.json({ status: 'AWAKE' });
+  }
+
+  // Best path: use order_id if provided
+  if (order_id) {
+    try {
+      const raw = await callTrack123ShopifyOrder(String(order_id).trim());
+      const normalized = normalizeTrack123OrderResponse(raw);
+
+      if (normalized.fulfillment) {
+        normalized.fulfillment.tracking_link = buildPublicTrackingUrl(
+          normalized.fulfillment.tracking_company,
+          normalized.fulfillment.tracking_number,
+          normalized.fulfillment.tracking_link
+        );
+      }
+
+      return res.json(normalized);
+    } catch (e) {
+      console.error('🚨 /api/track order_id mode failed:', e.message);
+    }
+  }
+
+  // Fallback path: tracking-number mode
+  // This depends on your Track123 tracking API setup being enabled.
+  if (!number) {
+    return res.status(400).json({ error: 'Missing number or order_id' });
+  }
 
   try {
     const cleanNumber = String(number).trim();
 
-    // Step 1: See if AfterShip already has it
-    let data = await callAfterShip(`trackings?tracking_numbers=${cleanNumber}`);
-    let track = data.data?.trackings?.[0];
+    // Depending on your Track123 account setup, you may need to register/import first,
+    // then query. The docs describe create/register + get/query flows. :contentReference[oaicite:3]{index=3}
+    const queryResult = await callTrack123Tracking('/gateway/open-api/tk/v2/track/query', {
+      trackings: [
+        {
+          tracking_number: cleanNumber,
+          carrier_code: carrier || undefined
+        }
+      ]
+    });
 
-    // Step 2: If it doesn't exist, Register it properly (WITH ENVELOPE)
-    if (!track) {
-      console.log(`📦 Registering new package: ${cleanNumber}`);
-      
-      const regResult = await callAfterShip('trackings', 'POST', { 
-        tracking: { tracking_number: cleanNumber } 
+    const item =
+      queryResult?.data?.trackings?.[0] ||
+      queryResult?.data?.items?.[0] ||
+      queryResult?.trackings?.[0] ||
+      null;
+
+    if (!item) {
+      return res.json({
+        found: false,
+        status: 'PENDING',
+        history: [],
+        fulfillment: {
+          tracking_number: cleanNumber,
+          tracking_company: carrier || '',
+          carrier_code: carrier || '',
+          transit_status: 'Pending',
+          transit_sub_status: '',
+          last_event: '',
+          last_event_time: '',
+          tracking_link: buildPublicTrackingUrl(carrier || '', cleanNumber, '')
+        }
       });
-
-      if (regResult.meta?.code === 4000) {
-          console.log("🛑 CRITICAL: AfterShip rejected the number. PLEASE CHECK IF 'ROYAL MAIL' IS ENABLED IN YOUR AFTERSHIP DASHBOARD (Settings > Couriers).");
-      }
-
-      return res.json({ status: 'PENDING', history: [] });
     }
 
-    // Step 3: Return the history
+    const history = Array.isArray(item.tracking_details)
+      ? item.tracking_details.map(ev => ({
+          date: ev.event_time || ev.event_time_utc || '',
+          detail: ev.event_detail || ev.status || '',
+          location: ev.event_location || ''
+        }))
+      : [];
+
+    const transitStatus = String(item.transit_status || item.status || '').toLowerCase();
+    let status = 'IN_TRANSIT';
+    if (transitStatus.includes('delivered')) status = 'DELIVERED';
+    else if (transitStatus.includes('exception')) status = 'ISSUE';
+    else if (transitStatus.includes('pending')) status = 'PENDING';
+
     return res.json({
-      status: track.tag === 'Delivered' ? 'DELIVERED' : 'IN_TRANSIT',
-      history: (track.checkpoints || []).map(cp => ({
-        date: cp.checkpoint_time,
-        detail: cp.message,
-        location: cp.location || ''
-      })).reverse()
+      found: true,
+      status,
+      history,
+      fulfillment: {
+        tracking_number: item.tracking_number || cleanNumber,
+        tracking_company: item.courier_name || item.tracking_company || carrier || '',
+        carrier_code: item.carrier_code || carrier || '',
+        transit_status: item.transit_status || item.status || '',
+        transit_sub_status: item.transit_sub_status || '',
+        last_event: item.last_event || '',
+        last_event_time: item.last_event_time || '',
+        tracking_link: buildPublicTrackingUrl(
+          item.courier_name || item.tracking_company || carrier || '',
+          item.tracking_number || cleanNumber,
+          item.query_link || ''
+        )
+      }
     });
   } catch (e) {
-    console.error('🚨 Hub Error:', e.message);
-    res.status(500).json({ error: 'Tracking unavailable' });
+    console.error('🚨 Tracking Error:', e.message);
+    return res.status(500).json({
+      error: 'Tracking unavailable',
+      message: e.message
+    });
   }
 });
 
 // =====================================================================
-// 2. SHOPIFY WEBHOOK (AUTO-SYNC)
+// 3. SHOPIFY WEBHOOK (OPTIONAL)
+// You can keep this route if your current Shopify webhook is already pointing here.
+// For Track123, webhook-based shipment syncing is also supported in their API/docs,
+// but if you're using order-based lookup, this route is optional. :contentReference[oaicite:4]{index=4}
 // =====================================================================
 app.post('/api/webhooks/fulfillment', async (req, res) => {
   res.status(200).send('OK');
+
   try {
-    const { tracking_number, tracking_numbers } = req.body;
-    let num = tracking_number || (tracking_numbers ? tracking_numbers[0] : null);
+    const { tracking_number, tracking_numbers, tracking_company } = req.body;
+    const num = tracking_number || (Array.isArray(tracking_numbers) ? tracking_numbers[0] : null);
+
     if (!num) return;
-    
-    num = String(num).trim();
-    
-    // Auto-Register via webhook (WITH ENVELOPE)
-    const result = await callAfterShip('trackings', 'POST', { 
-      tracking: { tracking_number: num } 
-    });
-    
-    if (result.meta?.code === 201 || result.meta?.code === 200 || result.meta?.code === 4003) {
-        console.log(`✅ Auto-Registered AfterShip: ${num}`);
-    }
-  } catch (e) { 
-      console.error('🚨 Webhook Error:', e.message); 
+
+    console.log(`📦 Fulfillment webhook received: ${num} (${tracking_company || 'carrier unknown'})`);
+
+    // Optional future enhancement:
+    // register/import the tracking into Track123 here if you want proactive sync
+    // instead of only on-demand order lookup.
+  } catch (e) {
+    console.error('🚨 Fulfillment Webhook Error:', e.message);
   }
 });
 
 // =====================================================================
-// 3. AI PROFILE SYNC (MAINTAINED)
+// 4. AI PROFILE SYNC (UNCHANGED)
 // =====================================================================
 app.post('/api/update-ai', async (req, res) => {
   const { customer_id, ai_overview } = req.body;
-  if (!customer_id) return res.status(400).json({ error: 'Missing ID' });
+
+  if (!customer_id) {
+    return res.status(400).json({ error: 'Missing ID' });
+  }
 
   try {
-    const ownerId = customer_id.includes('gid://') ? customer_id : `gid://shopify/Customer/${customer_id}`;
-    const query = `mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
-      metafieldsSet(metafields: $metafields) {
-        metafields { id }
-        userErrors { field message }
+    const ownerId = customer_id.includes('gid://')
+      ? customer_id
+      : `gid://shopify/Customer/${customer_id}`;
+
+    const query = `
+      mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+        metafieldsSet(metafields: $metafields) {
+          metafields { id }
+          userErrors { field message }
+        }
       }
-    }`;
-    const variables = { metafields: [{ ownerId, namespace: 'custom', key: 'ai_overview', type: 'multi_line_text_field', value: ai_overview }] };
+    `;
+
+    const variables = {
+      metafields: [
+        {
+          ownerId,
+          namespace: 'custom',
+          key: 'ai_overview',
+          type: 'multi_line_text_field',
+          value: ai_overview
+        }
+      ]
+    };
 
     await shopifyGraphQL(query, variables);
     res.json({ success: true });
@@ -167,4 +434,6 @@ app.post('/api/update-ai', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 AfterShip Hub active on ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Track123 Hub active on ${PORT}`);
+});
