@@ -52,9 +52,6 @@ async function shopifyGraphQL(query, variables = {}) {
 
 // =====================================================================
 // TRACK123 HELPERS
-// Track123 Shopify endpoint:
-// GET https://shp.track123.com/shopify/api/v1/{uuid}/orders/{orderId}.json
-// Auth header: X-Api-Key
 // =====================================================================
 async function callTrack123ShopifyOrder(orderId) {
   const { TRACK123_STORE_UUID, TRACK123_API_KEY } = process.env;
@@ -89,8 +86,6 @@ async function callTrack123ShopifyOrder(orderId) {
   return data;
 }
 
-// Optional direct tracking API fallback.
-// Track123 docs also expose tracking API flows for registering and querying trackings. :contentReference[oaicite:2]{index=2}
 async function callTrack123Tracking(endpoint, body) {
   const { TRACK123_API_KEY } = process.env;
 
@@ -127,10 +122,23 @@ async function callTrack123Tracking(endpoint, body) {
 // =====================================================================
 // HELPERS
 // =====================================================================
-function normalizeTrack123OrderResponse(raw) {
+function normalizeTrack123OrderResponse(raw, requestedTrackingNum = '') {
   const order = raw?.order || raw || {};
   const fulfillments = Array.isArray(order.fulfillments) ? order.fulfillments : [];
-  const fulfillment = fulfillments[0] || null;
+  
+  let fulfillment = fulfillments[0] || null;
+
+  // CRITICAL FIX: If a specific tracking number was requested, find THAT specific fulfillment box!
+  if (requestedTrackingNum) {
+    const safeReqNum = String(requestedTrackingNum).replace(/\s+/g, '').toUpperCase();
+    const match = fulfillments.find(f => {
+      const tn = String(f.tracking_number || '').replace(/\s+/g, '').toUpperCase();
+      return tn === safeReqNum;
+    });
+    if (match) {
+      fulfillment = match;
+    }
+  }
 
   if (!fulfillment) {
     return {
@@ -187,7 +195,6 @@ function normalizeTrack123OrderResponse(raw) {
   };
 }
 
-// Try to derive a better public tracking URL for carriers you care about.
 function buildPublicTrackingUrl(carrier, trackingNumber, fallbackUrl = '') {
   const c = String(carrier || '').toLowerCase();
   const n = String(trackingNumber || '').trim();
@@ -204,12 +211,11 @@ function buildPublicTrackingUrl(carrier, trackingNumber, fallbackUrl = '') {
 }
 
 // =====================================================================
-// 1. ORDER-BASED TRACKING API (BEST FOR YOUR HUB)
-// Example:
-// GET /api/order-tracking?order_id=1234567890
+// 1. ORDER-BASED TRACKING API
 // =====================================================================
 app.get('/api/order-tracking', async (req, res) => {
-  const { order_id } = req.query;
+  // CRITICAL FIX: Extract tracking_num from the request query
+  const { order_id, tracking_num } = req.query;
 
   if (order_id === 'KEEP_ALIVE') {
     return res.json({ status: 'AWAKE' });
@@ -221,7 +227,8 @@ app.get('/api/order-tracking', async (req, res) => {
 
   try {
     const raw = await callTrack123ShopifyOrder(String(order_id).trim());
-    const normalized = normalizeTrack123OrderResponse(raw);
+    // Pass the requested tracking number so it grabs the correct split package!
+    const normalized = normalizeTrack123OrderResponse(raw, tracking_num);
 
     if (normalized.fulfillment) {
       normalized.fulfillment.tracking_link = buildPublicTrackingUrl(
@@ -243,13 +250,6 @@ app.get('/api/order-tracking', async (req, res) => {
 
 // =====================================================================
 // 2. LEGACY TRACKING ROUTE
-// Keeps your storefront compatible if it already calls /api/track
-//
-// Preferred new usage:
-//   /api/order-tracking?order_id=...
-//
-// Temporary fallback:
-//   /api/track?number=...
 // =====================================================================
 app.get('/api/track', async (req, res) => {
   const { number, order_id, carrier } = req.query;
@@ -258,11 +258,10 @@ app.get('/api/track', async (req, res) => {
     return res.json({ status: 'AWAKE' });
   }
 
-  // Best path: use order_id if provided
   if (order_id) {
     try {
       const raw = await callTrack123ShopifyOrder(String(order_id).trim());
-      const normalized = normalizeTrack123OrderResponse(raw);
+      const normalized = normalizeTrack123OrderResponse(raw, number);
 
       if (normalized.fulfillment) {
         normalized.fulfillment.tracking_link = buildPublicTrackingUrl(
@@ -278,8 +277,6 @@ app.get('/api/track', async (req, res) => {
     }
   }
 
-  // Fallback path: tracking-number mode
-  // This depends on your Track123 tracking API setup being enabled.
   if (!number) {
     return res.status(400).json({ error: 'Missing number or order_id' });
   }
@@ -287,8 +284,6 @@ app.get('/api/track', async (req, res) => {
   try {
     const cleanNumber = String(number).trim();
 
-    // Depending on your Track123 account setup, you may need to register/import first,
-    // then query. The docs describe create/register + get/query flows. :contentReference[oaicite:3]{index=3}
     const queryResult = await callTrack123Tracking('/gateway/open-api/tk/v2/track/query', {
       trackings: [
         {
@@ -366,9 +361,6 @@ app.get('/api/track', async (req, res) => {
 
 // =====================================================================
 // 3. SHOPIFY WEBHOOK (OPTIONAL)
-// You can keep this route if your current Shopify webhook is already pointing here.
-// For Track123, webhook-based shipment syncing is also supported in their API/docs,
-// but if you're using order-based lookup, this route is optional. :contentReference[oaicite:4]{index=4}
 // =====================================================================
 app.post('/api/webhooks/fulfillment', async (req, res) => {
   res.status(200).send('OK');
@@ -380,10 +372,6 @@ app.post('/api/webhooks/fulfillment', async (req, res) => {
     if (!num) return;
 
     console.log(`📦 Fulfillment webhook received: ${num} (${tracking_company || 'carrier unknown'})`);
-
-    // Optional future enhancement:
-    // register/import the tracking into Track123 here if you want proactive sync
-    // instead of only on-demand order lookup.
   } catch (e) {
     console.error('🚨 Fulfillment Webhook Error:', e.message);
   }
