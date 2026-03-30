@@ -519,17 +519,18 @@ app.post('/api/wishlist-toggle', async (req, res) => {
 });
 
 // =====================================================================
-// 6. RESTOCK ALERTS API (NEW)
+// 6. RESTOCK ALERTS API (UPGRADED WITH REMOVE FUNCTION)
 // =====================================================================
 app.post('/api/restock-alert', async (req, res) => {
-  const { email, tags } = req.body;
+  // We now look for the 'action' parameter (defaults to 'add')
+  const { email, tags, action = 'add' } = req.body;
   
   if (!email || !tags || !Array.isArray(tags)) {
     return res.status(400).json({ error: 'Missing email or tags array' });
   }
 
   try {
-    // 1. Search Shopify for an existing customer with this email
+    // 1. Search Shopify for an existing customer
     const searchRes = await shopifyGraphQL(`
       query customerSearch($query: String!) {
         customers(first: 1, query: $query) {
@@ -543,10 +544,19 @@ app.post('/api/restock-alert', async (req, res) => {
     const existingCustomer = searchRes.data?.customers?.edges[0]?.node;
 
     if (existingCustomer) {
-      // 2a. Customer exists! Merge the new tags with their current tags
       const currentTags = existingCustomer.tags || [];
-      const mergedTags = Array.from(new Set([...currentTags, ...tags])); // Removes duplicates
+      let newTags;
 
+      // 2a. Determine if we are ADDING or REMOVING
+      if (action === 'remove') {
+        // Filter out any tags that match the ones we want to remove
+        newTags = currentTags.filter(t => !tags.includes(t));
+      } else {
+        // Add tags (prevent duplicates)
+        newTags = Array.from(new Set([...currentTags, ...tags]));
+      }
+
+      // 3. Update the customer profile
       const updateRes = await shopifyGraphQL(`
         mutation customerUpdate($input: CustomerInput!) {
           customerUpdate(input: $input) {
@@ -554,7 +564,7 @@ app.post('/api/restock-alert', async (req, res) => {
           }
         }
       `, {
-        input: { id: existingCustomer.id, tags: mergedTags }
+        input: { id: existingCustomer.id, tags: newTags }
       });
 
       if (updateRes.data?.customerUpdate?.userErrors?.length > 0) {
@@ -562,32 +572,34 @@ app.post('/api/restock-alert', async (req, res) => {
       }
 
     } else {
-      // 2b. Customer doesn't exist (Guest). Create a new profile with the tags!
-      const createRes = await shopifyGraphQL(`
-        mutation customerCreate($input: CustomerInput!) {
-          customerCreate(input: $input) {
-            userErrors { message }
+      // If customer doesn't exist, we only care if they are trying to ADD an alert
+      if (action === 'add') {
+        const createRes = await shopifyGraphQL(`
+          mutation customerCreate($input: CustomerInput!) {
+            customerCreate(input: $input) {
+              userErrors { message }
+            }
           }
-        }
-      `, {
-        input: {
-          email: email,
-          tags: tags,
-          emailMarketingConsent: {
-            marketingState: "SUBSCRIBED",
-            marketingOptInLevel: "SINGLE_OPT_IN"
+        `, {
+          input: {
+            email: email,
+            tags: tags,
+            emailMarketingConsent: {
+              marketingState: "SUBSCRIBED",
+              marketingOptInLevel: "SINGLE_OPT_IN"
+            }
           }
-        }
-      });
+        });
 
-      if (createRes.data?.customerCreate?.userErrors?.length > 0) {
-        throw new Error(createRes.data.customerCreate.userErrors[0].message);
+        if (createRes.data?.customerCreate?.userErrors?.length > 0) {
+          throw new Error(createRes.data.customerCreate.userErrors[0].message);
+        }
       }
     }
 
-    res.json({ success: true, message: 'Alert saved successfully!' });
+    res.json({ success: true, action: action, message: `Alert ${action === 'remove' ? 'removed' : 'saved'} successfully!` });
   } catch (error) {
     console.error('🚨 Restock Alert Failed:', error.message);
-    res.status(500).json({ error: 'Failed to save alert' });
+    res.status(500).json({ error: 'Failed to update alert' });
   }
 });
