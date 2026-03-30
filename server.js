@@ -425,3 +425,95 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Track123 Hub active on ${PORT}`);
 });
+
+// =====================================================================
+// 5. WISHLIST API (NEW)
+// =====================================================================
+
+// GET WISHLIST: Returns the array of handles
+app.get('/api/get-wishlist', async (req, res) => {
+  const { customerId } = req.query;
+  if (!customerId) return res.status(400).json({ error: 'Missing customerId' });
+
+  try {
+    const ownerId = customerId.includes('gid://') ? customerId : `gid://shopify/Customer/${customerId}`;
+    
+    // GraphQL to fetch the specific wishlist metafield
+    const query = `
+      query getCustomerWishlist($id: ID!) {
+        customer(id: $id) {
+          metafield(namespace: "custom", key: "wishlist") {
+            value
+          }
+        }
+      }
+    `;
+
+    const result = await shopifyGraphQL(query, { id: ownerId });
+    const rawValue = result.data?.customer?.metafield?.value;
+    
+    // If it exists, parse it; otherwise return an empty array
+    const wishlist = rawValue ? JSON.parse(rawValue) : [];
+    res.json({ wishlist });
+  } catch (error) {
+    console.error('🚨 Get Wishlist Failed:', error.message);
+    res.status(500).json({ error: 'Failed to fetch wishlist' });
+  }
+});
+
+// TOGGLE WISHLIST: Adds or Removes a handle
+app.post('/api/wishlist-toggle', async (req, res) => {
+  const { customerId, productHandle } = req.body;
+  if (!customerId || !productHandle) return res.status(400).json({ error: 'Missing data' });
+
+  try {
+    const ownerId = customerId.includes('gid://') ? customerId : `gid://shopify/Customer/${customerId}`;
+
+    // 1. Get current wishlist first
+    const getQuery = `
+      query getWish($id: ID!) {
+        customer(id: $id) {
+          metafield(namespace: "custom", key: "wishlist") {
+            value
+          }
+        }
+      }
+    `;
+    const currentRes = await shopifyGraphQL(getQuery, { id: ownerId });
+    const rawValue = currentRes.data?.customer?.metafield?.value;
+    let wishlist = rawValue ? JSON.parse(rawValue) : [];
+
+    // 2. Logic: Toggle the handle
+    if (wishlist.includes(productHandle)) {
+      wishlist = wishlist.filter(h => h !== productHandle); // Remove
+    } else {
+      wishlist.push(productHandle); // Add
+    }
+
+    // 3. Save back to Shopify
+    const setQuery = `
+      mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+        metafieldsSet(metafields: $metafields) {
+          metafields { id value }
+          userErrors { message }
+        }
+      }
+    `;
+
+    const variables = {
+      metafields: [{
+        ownerId,
+        namespace: 'custom',
+        key: 'wishlist',
+        type: 'json',
+        value: JSON.stringify(wishlist)
+      }]
+    };
+
+    await shopifyGraphQL(setQuery, variables);
+    res.json({ success: true, action: wishlist.includes(productHandle) ? 'added' : 'removed', wishlist });
+  } catch (error) {
+    console.error('🚨 Wishlist Toggle Failed:', error.message);
+    res.status(500).json({ error: 'Toggle failed' });
+  }
+});
