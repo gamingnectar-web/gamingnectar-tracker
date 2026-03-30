@@ -517,3 +517,77 @@ app.post('/api/wishlist-toggle', async (req, res) => {
     res.status(500).json({ error: 'Toggle failed' });
   }
 });
+
+// =====================================================================
+// 6. RESTOCK ALERTS API (NEW)
+// =====================================================================
+app.post('/api/restock-alert', async (req, res) => {
+  const { email, tags } = req.body;
+  
+  if (!email || !tags || !Array.isArray(tags)) {
+    return res.status(400).json({ error: 'Missing email or tags array' });
+  }
+
+  try {
+    // 1. Search Shopify for an existing customer with this email
+    const searchRes = await shopifyGraphQL(`
+      query customerSearch($query: String!) {
+        customers(first: 1, query: $query) {
+          edges {
+            node { id tags }
+          }
+        }
+      }
+    `, { query: `email:${email}` });
+
+    const existingCustomer = searchRes.data?.customers?.edges[0]?.node;
+
+    if (existingCustomer) {
+      // 2a. Customer exists! Merge the new tags with their current tags
+      const currentTags = existingCustomer.tags || [];
+      const mergedTags = Array.from(new Set([...currentTags, ...tags])); // Removes duplicates
+
+      const updateRes = await shopifyGraphQL(`
+        mutation customerUpdate($input: CustomerInput!) {
+          customerUpdate(input: $input) {
+            userErrors { message }
+          }
+        }
+      `, {
+        input: { id: existingCustomer.id, tags: mergedTags }
+      });
+
+      if (updateRes.data?.customerUpdate?.userErrors?.length > 0) {
+        throw new Error(updateRes.data.customerUpdate.userErrors[0].message);
+      }
+
+    } else {
+      // 2b. Customer doesn't exist (Guest). Create a new profile with the tags!
+      const createRes = await shopifyGraphQL(`
+        mutation customerCreate($input: CustomerInput!) {
+          customerCreate(input: $input) {
+            userErrors { message }
+          }
+        }
+      `, {
+        input: {
+          email: email,
+          tags: tags,
+          emailMarketingConsent: {
+            marketingState: "SUBSCRIBED",
+            marketingOptInLevel: "SINGLE_OPT_IN"
+          }
+        }
+      });
+
+      if (createRes.data?.customerCreate?.userErrors?.length > 0) {
+        throw new Error(createRes.data.customerCreate.userErrors[0].message);
+      }
+    }
+
+    res.json({ success: true, message: 'Alert saved successfully!' });
+  } catch (error) {
+    console.error('🚨 Restock Alert Failed:', error.message);
+    res.status(500).json({ error: 'Failed to save alert' });
+  }
+});
