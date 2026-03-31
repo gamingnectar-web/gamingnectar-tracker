@@ -519,11 +519,10 @@ app.post('/api/wishlist-toggle', async (req, res) => {
 });
 
 // =====================================================================
-// 6. RESTOCK ALERTS API (UPGRADED WITH REMOVE FUNCTION)
+// 6. RESTOCK ALERTS API (UPGRADED WITH METAFIELDS)
 // =====================================================================
 app.post('/api/restock-alert', async (req, res) => {
-  // We now look for the 'action' parameter (defaults to 'add')
-  const { email, tags, action = 'add' } = req.body;
+  const { email, tags, action = 'add', metafieldString } = req.body;
   
   if (!email || !tags || !Array.isArray(tags)) {
     return res.status(400).json({ error: 'Missing email or tags array' });
@@ -543,53 +542,69 @@ app.post('/api/restock-alert', async (req, res) => {
 
     const existingCustomer = searchRes.data?.customers?.edges[0]?.node;
 
+    // 2. Prepare Metafields Payload (Only update if action is 'add' and we have the string)
+    const metafieldsPayload = [];
+    if (metafieldString && action === 'add') {
+      metafieldsPayload.push({
+        namespace: "custom",
+        // NOTE: Check your Shopify Admin (Settings -> Custom Data) to confirm if this 
+        // key uses an underscore or a hyphen. It is usually "notification_latest".
+        key: "notification_latest", 
+        value: metafieldString,
+        type: "single_line_text_field"
+      });
+    }
+
     if (existingCustomer) {
       const currentTags = existingCustomer.tags || [];
       let newTags;
 
-      // 2a. Determine if we are ADDING or REMOVING
       if (action === 'remove') {
-        // Filter out any tags that match the ones we want to remove
         newTags = currentTags.filter(t => !tags.includes(t));
       } else {
-        // Add tags (prevent duplicates)
         newTags = Array.from(new Set([...currentTags, ...tags]));
       }
 
-      // 3. Update the customer profile
+      // 3. Update the customer profile with Tags AND Metafields
+      const updatePayload = { id: existingCustomer.id, tags: newTags };
+      if (metafieldsPayload.length > 0) {
+        updatePayload.metafields = metafieldsPayload;
+      }
+
       const updateRes = await shopifyGraphQL(`
         mutation customerUpdate($input: CustomerInput!) {
           customerUpdate(input: $input) {
             userErrors { message }
           }
         }
-      `, {
-        input: { id: existingCustomer.id, tags: newTags }
-      });
+      `, { input: updatePayload });
 
       if (updateRes.data?.customerUpdate?.userErrors?.length > 0) {
         throw new Error(updateRes.data.customerUpdate.userErrors[0].message);
       }
 
     } else {
-      // If customer doesn't exist, we only care if they are trying to ADD an alert
+      // If customer doesn't exist, we only create on 'add'
       if (action === 'add') {
+        const createPayload = {
+          email: email,
+          tags: tags,
+          emailMarketingConsent: {
+            marketingState: "SUBSCRIBED",
+            marketingOptInLevel: "SINGLE_OPT_IN"
+          }
+        };
+        if (metafieldsPayload.length > 0) {
+          createPayload.metafields = metafieldsPayload;
+        }
+
         const createRes = await shopifyGraphQL(`
           mutation customerCreate($input: CustomerInput!) {
             customerCreate(input: $input) {
               userErrors { message }
             }
           }
-        `, {
-          input: {
-            email: email,
-            tags: tags,
-            emailMarketingConsent: {
-              marketingState: "SUBSCRIBED",
-              marketingOptInLevel: "SINGLE_OPT_IN"
-            }
-          }
-        });
+        `, { input: createPayload });
 
         if (createRes.data?.customerCreate?.userErrors?.length > 0) {
           throw new Error(createRes.data.customerCreate.userErrors[0].message);
