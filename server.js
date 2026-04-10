@@ -618,3 +618,79 @@ app.post('/api/restock-alert', async (req, res) => {
     res.status(500).json({ error: 'Failed to update alert' });
   }
 });
+
+
+// =====================================================================
+// 7. AI RECOMMENDATIONS PROFILE API (NEW)
+// =====================================================================
+
+// GET AI PROFILE: Reads the user's flavor/vendor preferences from Shopify
+app.get('/api/get-ai-profile', async (req, res) => {
+  const { customerId } = req.query;
+  if (!customerId) return res.status(400).json({ error: 'Missing customerId' });
+
+  try {
+    const ownerId = customerId.includes('gid://') ? customerId : `gid://shopify/Customer/${customerId}`;
+    
+    // GraphQL to fetch the AI profile metafield
+    const query = `
+      query getCustomerAIProfile($id: ID!) {
+        customer(id: $id) {
+          metafield(namespace: "custom", key: "ai_profile") {
+            value
+          }
+        }
+      }
+    `;
+
+    const result = await shopifyGraphQL(query, { id: ownerId });
+    const rawValue = result.data?.customer?.metafield?.value;
+    
+    // If it exists, parse it; otherwise return an empty object
+    const profile = rawValue ? JSON.parse(rawValue) : {};
+    res.json({ profile });
+  } catch (error) {
+    console.error('🚨 Get AI Profile Failed:', error.message);
+    res.status(500).json({ error: 'Failed to fetch AI profile' });
+  }
+});
+
+// SAVE AI PROFILE: Writes the user's flavor/vendor preferences to Shopify
+app.post('/api/save-ai-profile', async (req, res) => {
+  const { customerId, profile } = req.body;
+  if (!customerId || !profile) return res.status(400).json({ error: 'Missing data' });
+
+  try {
+    const ownerId = customerId.includes('gid://') ? customerId : `gid://shopify/Customer/${customerId}`;
+
+    const setQuery = `
+      mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+        metafieldsSet(metafields: $metafields) {
+          metafields { id value }
+          userErrors { message }
+        }
+      }
+    `;
+
+    const variables = {
+      metafields: [{
+        ownerId,
+        namespace: 'custom',
+        key: 'ai_profile',
+        type: 'json',
+        value: JSON.stringify(profile) // Store the JS object as a JSON string
+      }]
+    };
+
+    const result = await shopifyGraphQL(setQuery, variables);
+    
+    if (result.data?.metafieldsSet?.userErrors?.length > 0) {
+      throw new Error(result.data.metafieldsSet.userErrors[0].message);
+    }
+
+    res.json({ success: true, profile });
+  } catch (error) {
+    console.error('🚨 Save AI Profile Failed:', error.message);
+    res.status(500).json({ error: 'Failed to save AI profile' });
+  }
+});
