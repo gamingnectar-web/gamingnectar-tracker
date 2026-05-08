@@ -7,7 +7,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // =====================================================================
-// OPTIONAL SHOPIFY HELPERS
+// SHOPIFY HELPERS
 // =====================================================================
 
 function getShopifyDomain() {
@@ -23,10 +23,6 @@ function getShopifyDomain() {
 }
 
 async function getShopifyToken() {
-  // Prefer a permanent Admin API token if you have one.
-  // Useful env names:
-  // SHOPIFY_ADMIN_API_ACCESS_TOKEN
-  // SHOPIFY_ACCESS_TOKEN
   if (process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN) {
     return process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN;
   }
@@ -36,13 +32,14 @@ async function getShopifyToken() {
   }
 
   const {
-    SHOPIFY_DOMAIN,
     SHOPIFY_CLIENT_ID,
     SHOPIFY_CLIENT_SECRET
   } = process.env;
 
-  if (!SHOPIFY_DOMAIN || !SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET) {
-    throw new Error('Missing Shopify credentials in environment.');
+  if (!SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET) {
+    throw new Error(
+      'Missing Shopify token. Add SHOPIFY_ADMIN_API_ACCESS_TOKEN or SHOPIFY_ACCESS_TOKEN.'
+    );
   }
 
   const response = await fetch(`https://${getShopifyDomain()}/admin/oauth/access_token`, {
@@ -68,7 +65,7 @@ async function getShopifyToken() {
 
 async function shopifyGraphQL(query, variables = {}) {
   const accessToken = await getShopifyToken();
-  const apiVersion = process.env.SHOPIFY_API_VERSION || '2026-04';
+  const apiVersion = process.env.SHOPIFY_API_VERSION || '2024-01';
 
   const response = await fetch(
     `https://${getShopifyDomain()}/admin/api/${apiVersion}/graphql.json`,
@@ -170,14 +167,174 @@ async function callTrack123Tracking(endpoint, body) {
 // GENERAL HELPERS
 // =====================================================================
 
-function isDeliveredText(value) {
-  return String(value || '').toLowerCase().includes('delivered');
-}
-
 function normalizeTrackingNumber(value) {
   return String(value || '')
     .replace(/\s+/g, '')
     .toUpperCase();
+}
+
+function isDeliveredText(value) {
+  return String(value || '').toLowerCase().includes('delivered');
+}
+
+function getFirstArray(...values) {
+  for (const value of values) {
+    if (Array.isArray(value) && value.length > 0) {
+      return value;
+    }
+  }
+
+  return [];
+}
+
+function mapTrackingEvent(item) {
+  return {
+    date:
+      item.event_time ||
+      item.eventTime ||
+      item.event_time_utc ||
+      item.eventTimeUtc ||
+      item.datetime ||
+      item.time ||
+      item.checkpoint_time ||
+      item.checkpointTime ||
+      item.created_at ||
+      item.createdAt ||
+      item.Date ||
+      '',
+    detail:
+      item.event_detail ||
+      item.eventDetail ||
+      item.status ||
+      item.message ||
+      item.description ||
+      item.checkpoint_status ||
+      item.checkpointStatus ||
+      item.StatusDescription ||
+      item.detail ||
+      '',
+    location:
+      item.event_location ||
+      item.eventLocation ||
+      item.location ||
+      item.checkpoint_location ||
+      item.checkpointLocation ||
+      item.Details ||
+      ''
+  };
+}
+
+function extractTrackingDetailsFromFulfillment(fulfillment) {
+  if (!fulfillment) {
+    return [];
+  }
+
+  const primaryEvents = getFirstArray(
+    fulfillment.tracking_details,
+    fulfillment.trackingDetails,
+    fulfillment.trackings,
+    fulfillment.tracking_events,
+    fulfillment.trackingEvents,
+    fulfillment.events,
+    fulfillment.checkpoints,
+    fulfillment.history,
+    fulfillment.details
+  );
+
+  if (primaryEvents.length > 0) {
+    return primaryEvents;
+  }
+
+  const destinationEvents = getFirstArray(
+    fulfillment.destination_info?.trackinfo,
+    fulfillment.destinationInfo?.trackinfo,
+    fulfillment.destination_info?.tracking_details,
+    fulfillment.destinationInfo?.trackingDetails
+  );
+
+  const originEvents = getFirstArray(
+    fulfillment.origin_info?.trackinfo,
+    fulfillment.originInfo?.trackinfo,
+    fulfillment.origin_info?.tracking_details,
+    fulfillment.originInfo?.trackingDetails
+  );
+
+  const combinedEvents = [
+    ...destinationEvents,
+    ...originEvents
+  ];
+
+  return combinedEvents;
+}
+
+function extractTrackingDetailsFromItem(item) {
+  if (!item) {
+    return [];
+  }
+
+  const primaryEvents = getFirstArray(
+    item.tracking_details,
+    item.trackingDetails,
+    item.tracking_events,
+    item.trackingEvents,
+    item.events,
+    item.checkpoints,
+    item.history,
+    item.details
+  );
+
+  if (primaryEvents.length > 0) {
+    return primaryEvents;
+  }
+
+  const destinationEvents = getFirstArray(
+    item.destination_info?.trackinfo,
+    item.destinationInfo?.trackinfo,
+    item.destination_info?.tracking_details,
+    item.destinationInfo?.trackingDetails
+  );
+
+  const originEvents = getFirstArray(
+    item.origin_info?.trackinfo,
+    item.originInfo?.trackinfo,
+    item.origin_info?.tracking_details,
+    item.originInfo?.trackingDetails
+  );
+
+  return [
+    ...destinationEvents,
+    ...originEvents
+  ];
+}
+
+function determineStatusFromText(...values) {
+  const text = values
+    .map((value) => String(value || '').toLowerCase())
+    .join(' ');
+
+  if (text.includes('delivered')) {
+    return 'DELIVERED';
+  }
+
+  if (
+    text.includes('exception') ||
+    text.includes('failed') ||
+    text.includes('returned') ||
+    text.includes('issue')
+  ) {
+    return 'ISSUE';
+  }
+
+  if (
+    text.includes('pending') ||
+    text.includes('info') ||
+    text.includes('not found') ||
+    text.includes('pre-transit')
+  ) {
+    return 'PENDING';
+  }
+
+  return 'IN_TRANSIT';
 }
 
 function normalizeTrack123OrderResponse(raw, requestedTrackingNum = '') {
@@ -186,7 +343,6 @@ function normalizeTrack123OrderResponse(raw, requestedTrackingNum = '') {
 
   let fulfillment = fulfillments[0] || null;
 
-  // If a specific tracking number was requested, find that fulfillment.
   if (requestedTrackingNum) {
     const safeReqNum = normalizeTrackingNumber(requestedTrackingNum);
 
@@ -205,6 +361,7 @@ function normalizeTrack123OrderResponse(raw, requestedTrackingNum = '') {
       found: false,
       status: 'UNAVAILABLE',
       history: [],
+      history_count: 0,
       order: {
         order_id: order.order_id || order.id || null,
         order_name: order.order_name || order.name || null
@@ -213,36 +370,20 @@ function normalizeTrack123OrderResponse(raw, requestedTrackingNum = '') {
     };
   }
 
-  const trackingDetails = Array.isArray(fulfillment.tracking_details)
-    ? fulfillment.tracking_details
-    : [];
+  const trackingDetails = extractTrackingDetailsFromFulfillment(fulfillment);
 
-  const transitStatus = String(
-    fulfillment.transit_status ||
-    fulfillment.status ||
-    ''
-  ).toLowerCase();
-
-  let status = 'IN_TRANSIT';
-
-  if (transitStatus.includes('delivered')) {
-    status = 'DELIVERED';
-  } else if (transitStatus.includes('exception')) {
-    status = 'ISSUE';
-  } else if (transitStatus.includes('pending')) {
-    status = 'PENDING';
-  } else if (transitStatus.includes('info')) {
-    status = 'PENDING';
-  }
+  const status = determineStatusFromText(
+    fulfillment.transit_status,
+    fulfillment.status,
+    fulfillment.transit_sub_status,
+    fulfillment.last_event
+  );
 
   return {
     found: true,
     status,
-    history: trackingDetails.map((item) => ({
-      date: item.event_time || item.event_time_utc || '',
-      detail: item.event_detail || item.status || '',
-      location: item.event_location || ''
-    })),
+    history: trackingDetails.map(mapTrackingEvent),
+    history_count: trackingDetails.length,
     order: {
       order_id: order.order_id || order.id || null,
       order_name: order.order_name || order.name || null,
@@ -253,11 +394,11 @@ function normalizeTrack123OrderResponse(raw, requestedTrackingNum = '') {
       tracking_number: fulfillment.tracking_number || '',
       tracking_company: fulfillment.tracking_company || fulfillment.courier?.name || '',
       carrier_code: fulfillment.carrier_code || '',
-      transit_status: fulfillment.transit_status || '',
+      transit_status: fulfillment.transit_status || fulfillment.status || '',
       transit_sub_status: fulfillment.transit_sub_status || '',
       last_event: fulfillment.last_event || '',
       last_event_time: fulfillment.last_event_time || '',
-      tracking_link: fulfillment.courier?.query_link || order.tracking_link || ''
+      tracking_link: fulfillment.courier?.query_link || fulfillment.query_link || order.tracking_link || ''
     }
   };
 }
@@ -287,9 +428,6 @@ function buildPublicTrackingUrl(carrier, trackingNumber, fallbackUrl = '') {
 
 const DELIVERED_ORDER_TAG = process.env.DELIVERED_ORDER_TAG || 'delivered';
 
-// Default is conservative.
-// false = only tag order if every known tracked fulfillment is delivered.
-// true = tag order when the requested/current fulfillment is delivered.
 const TAG_ORDER_ON_PARTIAL_DELIVERY =
   String(process.env.TAG_ORDER_ON_PARTIAL_DELIVERY || '').toLowerCase() === 'true';
 
@@ -304,8 +442,6 @@ function toShopifyOrderGid(orderId) {
     return value;
   }
 
-  // Only convert numeric Shopify order IDs.
-  // Do not convert order names like "#1021" directly into GIDs.
   if (/^\d+$/.test(value)) {
     return `gid://shopify/Order/${value}`;
   }
@@ -320,11 +456,15 @@ function extractOrderInfo(raw, normalized = {}) {
     orderId:
       normalized?.order?.order_id ||
       order.order_id ||
+      order.orderId ||
+      order.shopify_order_id ||
+      order.shopifyOrderId ||
       order.id ||
       null,
     orderName:
       normalized?.order?.order_name ||
       order.order_name ||
+      order.orderName ||
       order.name ||
       null
   };
@@ -390,9 +530,9 @@ function fulfillmentLooksDelivered(fulfillment) {
 
   return (
     isDeliveredText(fulfillment.transit_status) ||
+    isDeliveredText(fulfillment.status) ||
     isDeliveredText(fulfillment.transit_sub_status) ||
-    isDeliveredText(fulfillment.last_event) ||
-    isDeliveredText(fulfillment.status)
+    isDeliveredText(fulfillment.last_event)
   );
 }
 
@@ -407,12 +547,11 @@ function allKnownFulfillmentsDelivered(raw, normalized) {
   const trackableFulfillments = fulfillments.filter((fulfillment) => (
     fulfillment.tracking_number ||
     fulfillment.transit_status ||
+    fulfillment.status ||
     fulfillment.transit_sub_status ||
     fulfillment.last_event
   ));
 
-  // If Track123 did not return fulfillment-level detail,
-  // fall back to the selected normalized fulfillment status.
   if (trackableFulfillments.length === 0) {
     return normalized?.status === 'DELIVERED';
   }
@@ -558,8 +697,6 @@ app.get('/api/track', async (req, res) => {
     return res.json({ status: 'AWAKE' });
   }
 
-  // Order ID mode.
-  // This mode can update Shopify because we can resolve the Shopify order.
   if (order_id) {
     try {
       const raw = await callTrack123ShopifyOrder(String(order_id).trim());
@@ -585,9 +722,6 @@ app.get('/api/track', async (req, res) => {
     return res.status(400).json({ error: 'Missing number or order_id' });
   }
 
-  // Tracking-number-only mode.
-  // This cannot reliably tag a Shopify order because Track123 may not return
-  // the Shopify order ID from this endpoint.
   try {
     const cleanNumber = String(number).trim();
 
@@ -604,6 +738,7 @@ app.get('/api/track', async (req, res) => {
       queryResult?.data?.trackings?.[0] ||
       queryResult?.data?.items?.[0] ||
       queryResult?.trackings?.[0] ||
+      queryResult?.items?.[0] ||
       null;
 
     if (!item) {
@@ -611,6 +746,7 @@ app.get('/api/track', async (req, res) => {
         found: false,
         status: 'PENDING',
         history: [],
+        history_count: 0,
         shopify_tag_update: {
           success: false,
           skipped: true,
@@ -629,50 +765,69 @@ app.get('/api/track', async (req, res) => {
       });
     }
 
-    const history = Array.isArray(item.tracking_details)
-      ? item.tracking_details.map((event) => ({
-          date: event.event_time || event.event_time_utc || '',
-          detail: event.event_detail || event.status || '',
-          location: event.event_location || ''
-        }))
-      : [];
+    const trackingDetails = extractTrackingDetailsFromItem(item);
 
-    const transitStatus = String(item.transit_status || item.status || '').toLowerCase();
+    const status = determineStatusFromText(
+      item.transit_status,
+      item.status,
+      item.transit_sub_status,
+      item.last_event
+    );
 
-    let status = 'IN_TRANSIT';
-
-    if (transitStatus.includes('delivered')) {
-      status = 'DELIVERED';
-    } else if (transitStatus.includes('exception')) {
-      status = 'ISSUE';
-    } else if (transitStatus.includes('pending')) {
-      status = 'PENDING';
-    }
-
-    return res.json({
+    const normalized = {
       found: true,
       status,
-      history,
-      shopify_tag_update: {
-        success: false,
-        skipped: true,
-        reason: 'tracking_number_only_no_shopify_order_id'
+      history: trackingDetails.map(mapTrackingEvent),
+      history_count: trackingDetails.length,
+      order: {
+        order_id:
+          item.order_id ||
+          item.orderId ||
+          item.shopify_order_id ||
+          item.shopifyOrderId ||
+          null,
+        order_name:
+          item.order_name ||
+          item.orderName ||
+          item.name ||
+          null
       },
       fulfillment: {
-        tracking_number: item.tracking_number || cleanNumber,
-        tracking_company: item.courier_name || item.tracking_company || carrier || '',
-        carrier_code: item.carrier_code || carrier || '',
+        tracking_number: item.tracking_number || item.trackingNumber || cleanNumber,
+        tracking_company: item.courier_name || item.courierName || item.tracking_company || carrier || '',
+        carrier_code: item.carrier_code || item.carrierCode || carrier || '',
         transit_status: item.transit_status || item.status || '',
-        transit_sub_status: item.transit_sub_status || '',
-        last_event: item.last_event || '',
-        last_event_time: item.last_event_time || '',
+        transit_sub_status: item.transit_sub_status || item.transitSubStatus || '',
+        last_event: item.last_event || item.lastEvent || '',
+        last_event_time: item.last_event_time || item.lastEventTime || '',
         tracking_link: buildPublicTrackingUrl(
-          item.courier_name || item.tracking_company || carrier || '',
-          item.tracking_number || cleanNumber,
-          item.query_link || ''
+          item.courier_name || item.courierName || item.tracking_company || carrier || '',
+          item.tracking_number || item.trackingNumber || cleanNumber,
+          item.query_link || item.queryLink || ''
         )
       }
-    });
+    };
+
+    const rawForTagging = {
+      order: {
+        order_id: normalized.order.order_id,
+        order_name: normalized.order.order_name,
+        fulfillments: [
+          {
+            tracking_number: normalized.fulfillment.tracking_number,
+            tracking_company: normalized.fulfillment.tracking_company,
+            transit_status: normalized.fulfillment.transit_status,
+            transit_sub_status: normalized.fulfillment.transit_sub_status,
+            last_event: normalized.fulfillment.last_event,
+            tracking_details: trackingDetails
+          }
+        ]
+      }
+    };
+
+    normalized.shopify_tag_update = await safelyTagDeliveredOrder(rawForTagging, normalized);
+
+    return res.json(normalized);
   } catch (error) {
     console.error('Tracking Error:', error.message);
 
@@ -714,7 +869,7 @@ app.post('/api/webhooks/fulfillment', async (req, res) => {
 // =====================================================================
 // 4. TRACK123 WEBHOOK
 // Optional automatic delivered tagging.
-// Configure this webhook URL in Track123 if available:
+// Webhook URL:
 // https://YOUR-SERVER-DOMAIN/api/webhooks/track123
 // =====================================================================
 
