@@ -2,22 +2,54 @@ const express = require('express');
 const cors = require('cors');
 
 const app = express();
+
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // =====================================================================
 // OPTIONAL SHOPIFY HELPERS
-// Keep these only if your /api/update-ai route already works with them.
 // =====================================================================
+
+function getShopifyDomain() {
+  const domain = process.env.SHOPIFY_DOMAIN;
+
+  if (!domain) {
+    throw new Error('Missing SHOPIFY_DOMAIN in environment.');
+  }
+
+  return domain
+    .replace(/^https?:\/\//, '')
+    .replace(/\/$/, '');
+}
+
 async function getShopifyToken() {
-  const { SHOPIFY_DOMAIN, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET } = process.env;
+  // Prefer a permanent Admin API token if you have one.
+  // Useful env names:
+  // SHOPIFY_ADMIN_API_ACCESS_TOKEN
+  // SHOPIFY_ACCESS_TOKEN
+  if (process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN) {
+    return process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN;
+  }
+
+  if (process.env.SHOPIFY_ACCESS_TOKEN) {
+    return process.env.SHOPIFY_ACCESS_TOKEN;
+  }
+
+  const {
+    SHOPIFY_DOMAIN,
+    SHOPIFY_CLIENT_ID,
+    SHOPIFY_CLIENT_SECRET
+  } = process.env;
+
   if (!SHOPIFY_DOMAIN || !SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET) {
     throw new Error('Missing Shopify credentials in environment.');
   }
 
-  const response = await fetch(`https://${SHOPIFY_DOMAIN}/admin/oauth/access_token`, {
+  const response = await fetch(`https://${getShopifyDomain()}/admin/oauth/access_token`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
     body: new URLSearchParams({
       grant_type: 'client_credentials',
       client_id: SHOPIFY_CLIENT_ID,
@@ -26,15 +58,20 @@ async function getShopifyToken() {
   });
 
   const data = await response.json();
-  if (data.access_token) return data.access_token;
+
+  if (data.access_token) {
+    return data.access_token;
+  }
+
   throw new Error(`Shopify token generation failed: ${JSON.stringify(data)}`);
 }
 
 async function shopifyGraphQL(query, variables = {}) {
   const accessToken = await getShopifyToken();
+  const apiVersion = process.env.SHOPIFY_API_VERSION || '2026-04';
 
   const response = await fetch(
-    `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2024-01/graphql.json`,
+    `https://${getShopifyDomain()}/admin/api/${apiVersion}/graphql.json`,
     {
       method: 'POST',
       headers: {
@@ -46,15 +83,23 @@ async function shopifyGraphQL(query, variables = {}) {
   );
 
   const data = await response.json();
-  if (data.errors) throw new Error(JSON.stringify(data.errors));
+
+  if (data.errors) {
+    throw new Error(JSON.stringify(data.errors));
+  }
+
   return data;
 }
 
 // =====================================================================
 // TRACK123 HELPERS
 // =====================================================================
+
 async function callTrack123ShopifyOrder(orderId) {
-  const { TRACK123_STORE_UUID, TRACK123_API_KEY } = process.env;
+  const {
+    TRACK123_STORE_UUID,
+    TRACK123_API_KEY
+  } = process.env;
 
   if (!TRACK123_STORE_UUID || !TRACK123_API_KEY) {
     throw new Error('Missing Track123 credentials in environment.');
@@ -66,13 +111,14 @@ async function callTrack123ShopifyOrder(orderId) {
     method: 'GET',
     headers: {
       'X-Api-Key': TRACK123_API_KEY,
-      'Accept': 'application/json'
+      Accept: 'application/json'
     }
   });
 
   const text = await res.text();
 
   let data;
+
   try {
     data = JSON.parse(text);
   } catch {
@@ -98,7 +144,7 @@ async function callTrack123Tracking(endpoint, body) {
     headers: {
       'Content-Type': 'application/json',
       'Track123-Api-Key': TRACK123_API_KEY,
-      'Accept': 'application/json'
+      Accept: 'application/json'
     },
     body: JSON.stringify(body)
   });
@@ -106,6 +152,7 @@ async function callTrack123Tracking(endpoint, body) {
   const text = await res.text();
 
   let data;
+
   try {
     data = JSON.parse(text);
   } catch {
@@ -120,21 +167,34 @@ async function callTrack123Tracking(endpoint, body) {
 }
 
 // =====================================================================
-// HELPERS
+// GENERAL HELPERS
 // =====================================================================
+
+function isDeliveredText(value) {
+  return String(value || '').toLowerCase().includes('delivered');
+}
+
+function normalizeTrackingNumber(value) {
+  return String(value || '')
+    .replace(/\s+/g, '')
+    .toUpperCase();
+}
+
 function normalizeTrack123OrderResponse(raw, requestedTrackingNum = '') {
   const order = raw?.order || raw || {};
   const fulfillments = Array.isArray(order.fulfillments) ? order.fulfillments : [];
-  
+
   let fulfillment = fulfillments[0] || null;
 
-  // CRITICAL FIX: If a specific tracking number was requested, find THAT specific fulfillment box!
+  // If a specific tracking number was requested, find that fulfillment.
   if (requestedTrackingNum) {
-    const safeReqNum = String(requestedTrackingNum).replace(/\s+/g, '').toUpperCase();
-    const match = fulfillments.find(f => {
-      const tn = String(f.tracking_number || '').replace(/\s+/g, '').toUpperCase();
+    const safeReqNum = normalizeTrackingNumber(requestedTrackingNum);
+
+    const match = fulfillments.find((f) => {
+      const tn = normalizeTrackingNumber(f.tracking_number);
       return tn === safeReqNum;
     });
+
     if (match) {
       fulfillment = match;
     }
@@ -146,8 +206,8 @@ function normalizeTrack123OrderResponse(raw, requestedTrackingNum = '') {
       status: 'UNAVAILABLE',
       history: [],
       order: {
-        order_id: order.order_id || null,
-        order_name: order.order_name || null
+        order_id: order.order_id || order.id || null,
+        order_name: order.order_name || order.name || null
       },
       fulfillment: null
     };
@@ -157,25 +217,35 @@ function normalizeTrack123OrderResponse(raw, requestedTrackingNum = '') {
     ? fulfillment.tracking_details
     : [];
 
-  const transitStatus = String(fulfillment.transit_status || '').toLowerCase();
+  const transitStatus = String(
+    fulfillment.transit_status ||
+    fulfillment.status ||
+    ''
+  ).toLowerCase();
 
   let status = 'IN_TRANSIT';
-  if (transitStatus.includes('delivered')) status = 'DELIVERED';
-  else if (transitStatus.includes('exception')) status = 'ISSUE';
-  else if (transitStatus.includes('pending')) status = 'PENDING';
-  else if (transitStatus.includes('info')) status = 'PENDING';
+
+  if (transitStatus.includes('delivered')) {
+    status = 'DELIVERED';
+  } else if (transitStatus.includes('exception')) {
+    status = 'ISSUE';
+  } else if (transitStatus.includes('pending')) {
+    status = 'PENDING';
+  } else if (transitStatus.includes('info')) {
+    status = 'PENDING';
+  }
 
   return {
     found: true,
     status,
-    history: trackingDetails.map(item => ({
+    history: trackingDetails.map((item) => ({
       date: item.event_time || item.event_time_utc || '',
       detail: item.event_detail || item.status || '',
       location: item.event_location || ''
     })),
     order: {
-      order_id: order.order_id || null,
-      order_name: order.order_name || null,
+      order_id: order.order_id || order.id || null,
+      order_name: order.order_name || order.name || null,
       order_status: order.status || ''
     },
     fulfillment: {
@@ -187,10 +257,7 @@ function normalizeTrack123OrderResponse(raw, requestedTrackingNum = '') {
       transit_sub_status: fulfillment.transit_sub_status || '',
       last_event: fulfillment.last_event || '',
       last_event_time: fulfillment.last_event_time || '',
-      tracking_link:
-        fulfillment.courier?.query_link ||
-        order.tracking_link ||
-        ''
+      tracking_link: fulfillment.courier?.query_link || order.tracking_link || ''
     }
   };
 }
@@ -198,11 +265,15 @@ function normalizeTrack123OrderResponse(raw, requestedTrackingNum = '') {
 function buildPublicTrackingUrl(carrier, trackingNumber, fallbackUrl = '') {
   const c = String(carrier || '').toLowerCase();
   const n = String(trackingNumber || '').trim();
-  if (!n) return fallbackUrl || '';
+
+  if (!n) {
+    return fallbackUrl || '';
+  }
 
   if (c.includes('royal mail')) {
     return `https://www.royalmail.com/track-your-item#/tracking-results/${encodeURIComponent(n)}`;
   }
+
   if (c.includes('evri') || c.includes('hermes')) {
     return `https://www.evri.com/track-a-parcel/tracking-details?trackingId=${encodeURIComponent(n)}`;
   }
@@ -211,10 +282,236 @@ function buildPublicTrackingUrl(carrier, trackingNumber, fallbackUrl = '') {
 }
 
 // =====================================================================
+// DELIVERED ORDER TAG HELPERS
+// =====================================================================
+
+const DELIVERED_ORDER_TAG = process.env.DELIVERED_ORDER_TAG || 'delivered';
+
+// Default is conservative.
+// false = only tag order if every known tracked fulfillment is delivered.
+// true = tag order when the requested/current fulfillment is delivered.
+const TAG_ORDER_ON_PARTIAL_DELIVERY =
+  String(process.env.TAG_ORDER_ON_PARTIAL_DELIVERY || '').toLowerCase() === 'true';
+
+function toShopifyOrderGid(orderId) {
+  const value = String(orderId || '').trim();
+
+  if (!value) {
+    return null;
+  }
+
+  if (value.startsWith('gid://shopify/Order/')) {
+    return value;
+  }
+
+  // Only convert numeric Shopify order IDs.
+  // Do not convert order names like "#1021" directly into GIDs.
+  if (/^\d+$/.test(value)) {
+    return `gid://shopify/Order/${value}`;
+  }
+
+  return null;
+}
+
+function extractOrderInfo(raw, normalized = {}) {
+  const order = raw?.order || raw || {};
+
+  return {
+    orderId:
+      normalized?.order?.order_id ||
+      order.order_id ||
+      order.id ||
+      null,
+    orderName:
+      normalized?.order?.order_name ||
+      order.order_name ||
+      order.name ||
+      null
+  };
+}
+
+async function findShopifyOrderGidByName(orderName) {
+  const rawName = String(orderName || '').trim();
+
+  if (!rawName) {
+    return null;
+  }
+
+  const nameWithHash = rawName.startsWith('#') ? rawName : `#${rawName}`;
+  const nameWithoutHash = rawName.replace(/^#/, '');
+
+  const query = `
+    query FindOrderByName($query: String!) {
+      orders(first: 1, query: $query) {
+        edges {
+          node {
+            id
+            name
+          }
+        }
+      }
+    }
+  `;
+
+  const attempts = [
+    `name:${nameWithHash}`,
+    `name:${nameWithoutHash}`
+  ];
+
+  for (const searchQuery of attempts) {
+    const result = await shopifyGraphQL(query, {
+      query: searchQuery
+    });
+
+    const order = result.data?.orders?.edges?.[0]?.node;
+
+    if (order?.id) {
+      return order.id;
+    }
+  }
+
+  return null;
+}
+
+async function resolveShopifyOrderGid(orderId, orderName) {
+  const directGid = toShopifyOrderGid(orderId);
+
+  if (directGid) {
+    return directGid;
+  }
+
+  return findShopifyOrderGidByName(orderName);
+}
+
+function fulfillmentLooksDelivered(fulfillment) {
+  if (!fulfillment) {
+    return false;
+  }
+
+  return (
+    isDeliveredText(fulfillment.transit_status) ||
+    isDeliveredText(fulfillment.transit_sub_status) ||
+    isDeliveredText(fulfillment.last_event) ||
+    isDeliveredText(fulfillment.status)
+  );
+}
+
+function allKnownFulfillmentsDelivered(raw, normalized) {
+  const order = raw?.order || raw || {};
+  const fulfillments = Array.isArray(order.fulfillments) ? order.fulfillments : [];
+
+  if (TAG_ORDER_ON_PARTIAL_DELIVERY) {
+    return normalized?.status === 'DELIVERED';
+  }
+
+  const trackableFulfillments = fulfillments.filter((fulfillment) => (
+    fulfillment.tracking_number ||
+    fulfillment.transit_status ||
+    fulfillment.transit_sub_status ||
+    fulfillment.last_event
+  ));
+
+  // If Track123 did not return fulfillment-level detail,
+  // fall back to the selected normalized fulfillment status.
+  if (trackableFulfillments.length === 0) {
+    return normalized?.status === 'DELIVERED';
+  }
+
+  return trackableFulfillments.every(fulfillmentLooksDelivered);
+}
+
+async function addDeliveredTagToShopifyOrder(orderId, orderName) {
+  const shopifyOrderGid = await resolveShopifyOrderGid(orderId, orderName);
+
+  if (!shopifyOrderGid) {
+    return {
+      success: false,
+      skipped: true,
+      reason: 'missing_or_invalid_shopify_order_id',
+      orderId: orderId || null,
+      orderName: orderName || null
+    };
+  }
+
+  const mutation = `
+    mutation AddDeliveredTag($id: ID!, $tags: [String!]!) {
+      tagsAdd(id: $id, tags: $tags) {
+        node {
+          id
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `;
+
+  const result = await shopifyGraphQL(mutation, {
+    id: shopifyOrderGid,
+    tags: [DELIVERED_ORDER_TAG]
+  });
+
+  const userErrors = result.data?.tagsAdd?.userErrors || [];
+
+  if (userErrors.length > 0) {
+    throw new Error(
+      `Shopify tagsAdd failed: ${userErrors.map((error) => error.message).join(', ')}`
+    );
+  }
+
+  return {
+    success: true,
+    skipped: false,
+    orderId: shopifyOrderGid,
+    tag: DELIVERED_ORDER_TAG
+  };
+}
+
+async function maybeTagDeliveredOrder(raw, normalized) {
+  if (!normalized?.found) {
+    return {
+      success: false,
+      skipped: true,
+      reason: 'tracking_not_found'
+    };
+  }
+
+  if (!allKnownFulfillmentsDelivered(raw, normalized)) {
+    return {
+      success: false,
+      skipped: true,
+      reason: TAG_ORDER_ON_PARTIAL_DELIVERY
+        ? 'selected_fulfillment_not_delivered'
+        : 'order_not_fully_delivered'
+    };
+  }
+
+  const { orderId, orderName } = extractOrderInfo(raw, normalized);
+
+  return addDeliveredTagToShopifyOrder(orderId, orderName);
+}
+
+async function safelyTagDeliveredOrder(raw, normalized) {
+  try {
+    return await maybeTagDeliveredOrder(raw, normalized);
+  } catch (error) {
+    console.error('Delivered order tag update failed:', error.message);
+
+    return {
+      success: false,
+      skipped: false,
+      reason: 'shopify_tag_update_failed',
+      message: error.message
+    };
+  }
+}
+
+// =====================================================================
 // 1. ORDER-BASED TRACKING API
 // =====================================================================
+
 app.get('/api/order-tracking', async (req, res) => {
-  // CRITICAL FIX: Extract tracking_num from the request query
   const { order_id, tracking_num } = req.query;
 
   if (order_id === 'KEEP_ALIVE') {
@@ -227,7 +524,6 @@ app.get('/api/order-tracking', async (req, res) => {
 
   try {
     const raw = await callTrack123ShopifyOrder(String(order_id).trim());
-    // Pass the requested tracking number so it grabs the correct split package!
     const normalized = normalizeTrack123OrderResponse(raw, tracking_num);
 
     if (normalized.fulfillment) {
@@ -238,12 +534,15 @@ app.get('/api/order-tracking', async (req, res) => {
       );
     }
 
+    normalized.shopify_tag_update = await safelyTagDeliveredOrder(raw, normalized);
+
     return res.json(normalized);
-  } catch (e) {
-    console.error('🚨 Order Tracking Error:', e.message);
+  } catch (error) {
+    console.error('Order Tracking Error:', error.message);
+
     return res.status(500).json({
       error: 'Order tracking unavailable',
-      message: e.message
+      message: error.message
     });
   }
 });
@@ -251,6 +550,7 @@ app.get('/api/order-tracking', async (req, res) => {
 // =====================================================================
 // 2. LEGACY TRACKING ROUTE
 // =====================================================================
+
 app.get('/api/track', async (req, res) => {
   const { number, order_id, carrier } = req.query;
 
@@ -258,6 +558,8 @@ app.get('/api/track', async (req, res) => {
     return res.json({ status: 'AWAKE' });
   }
 
+  // Order ID mode.
+  // This mode can update Shopify because we can resolve the Shopify order.
   if (order_id) {
     try {
       const raw = await callTrack123ShopifyOrder(String(order_id).trim());
@@ -271,9 +573,11 @@ app.get('/api/track', async (req, res) => {
         );
       }
 
+      normalized.shopify_tag_update = await safelyTagDeliveredOrder(raw, normalized);
+
       return res.json(normalized);
-    } catch (e) {
-      console.error('🚨 /api/track order_id mode failed:', e.message);
+    } catch (error) {
+      console.error('/api/track order_id mode failed:', error.message);
     }
   }
 
@@ -281,6 +585,9 @@ app.get('/api/track', async (req, res) => {
     return res.status(400).json({ error: 'Missing number or order_id' });
   }
 
+  // Tracking-number-only mode.
+  // This cannot reliably tag a Shopify order because Track123 may not return
+  // the Shopify order ID from this endpoint.
   try {
     const cleanNumber = String(number).trim();
 
@@ -304,6 +611,11 @@ app.get('/api/track', async (req, res) => {
         found: false,
         status: 'PENDING',
         history: [],
+        shopify_tag_update: {
+          success: false,
+          skipped: true,
+          reason: 'tracking_number_only_no_shopify_order_id'
+        },
         fulfillment: {
           tracking_number: cleanNumber,
           tracking_company: carrier || '',
@@ -318,23 +630,34 @@ app.get('/api/track', async (req, res) => {
     }
 
     const history = Array.isArray(item.tracking_details)
-      ? item.tracking_details.map(ev => ({
-          date: ev.event_time || ev.event_time_utc || '',
-          detail: ev.event_detail || ev.status || '',
-          location: ev.event_location || ''
+      ? item.tracking_details.map((event) => ({
+          date: event.event_time || event.event_time_utc || '',
+          detail: event.event_detail || event.status || '',
+          location: event.event_location || ''
         }))
       : [];
 
     const transitStatus = String(item.transit_status || item.status || '').toLowerCase();
+
     let status = 'IN_TRANSIT';
-    if (transitStatus.includes('delivered')) status = 'DELIVERED';
-    else if (transitStatus.includes('exception')) status = 'ISSUE';
-    else if (transitStatus.includes('pending')) status = 'PENDING';
+
+    if (transitStatus.includes('delivered')) {
+      status = 'DELIVERED';
+    } else if (transitStatus.includes('exception')) {
+      status = 'ISSUE';
+    } else if (transitStatus.includes('pending')) {
+      status = 'PENDING';
+    }
 
     return res.json({
       found: true,
       status,
       history,
+      shopify_tag_update: {
+        success: false,
+        skipped: true,
+        reason: 'tracking_number_only_no_shopify_order_id'
+      },
       fulfillment: {
         tracking_number: item.tracking_number || cleanNumber,
         tracking_company: item.courier_name || item.tracking_company || carrier || '',
@@ -350,36 +673,94 @@ app.get('/api/track', async (req, res) => {
         )
       }
     });
-  } catch (e) {
-    console.error('🚨 Tracking Error:', e.message);
+  } catch (error) {
+    console.error('Tracking Error:', error.message);
+
     return res.status(500).json({
       error: 'Tracking unavailable',
-      message: e.message
+      message: error.message
     });
   }
 });
 
 // =====================================================================
-// 3. SHOPIFY WEBHOOK (OPTIONAL)
+// 3. SHOPIFY FULFILLMENT WEBHOOK
 // =====================================================================
+
 app.post('/api/webhooks/fulfillment', async (req, res) => {
   res.status(200).send('OK');
 
   try {
-    const { tracking_number, tracking_numbers, tracking_company } = req.body;
-    const num = tracking_number || (Array.isArray(tracking_numbers) ? tracking_numbers[0] : null);
+    const {
+      tracking_number,
+      tracking_numbers,
+      tracking_company
+    } = req.body;
 
-    if (!num) return;
+    const num =
+      tracking_number ||
+      (Array.isArray(tracking_numbers) ? tracking_numbers[0] : null);
 
-    console.log(`📦 Fulfillment webhook received: ${num} (${tracking_company || 'carrier unknown'})`);
-  } catch (e) {
-    console.error('🚨 Fulfillment Webhook Error:', e.message);
+    if (!num) {
+      return;
+    }
+
+    console.log(`Fulfillment webhook received: ${num} (${tracking_company || 'carrier unknown'})`);
+  } catch (error) {
+    console.error('Fulfillment Webhook Error:', error.message);
   }
 });
 
 // =====================================================================
-// 4. AI PROFILE SYNC (UNCHANGED)
+// 4. TRACK123 WEBHOOK
+// Optional automatic delivered tagging.
+// Configure this webhook URL in Track123 if available:
+// https://YOUR-SERVER-DOMAIN/api/webhooks/track123
 // =====================================================================
+
+app.post('/api/webhooks/track123', async (req, res) => {
+  res.status(200).send('OK');
+
+  try {
+    const payload = req.body || {};
+
+    const transitStatus =
+      payload.transitStatus ||
+      payload.transit_status ||
+      payload.status ||
+      payload.deliveryStatus ||
+      payload.delivery_status ||
+      '';
+
+    if (!isDeliveredText(transitStatus)) {
+      return;
+    }
+
+    const orderId =
+      payload.orderId ||
+      payload.order_id ||
+      payload.shopifyOrderId ||
+      payload.shopify_order_id ||
+      null;
+
+    const orderName =
+      payload.orderName ||
+      payload.order_name ||
+      payload.name ||
+      null;
+
+    const update = await addDeliveredTagToShopifyOrder(orderId, orderName);
+
+    console.log('Track123 delivered webhook tag update:', update);
+  } catch (error) {
+    console.error('Track123 Webhook Error:', error.message);
+  }
+});
+
+// =====================================================================
+// 5. AI PROFILE SYNC
+// =====================================================================
+
 app.post('/api/update-ai', async (req, res) => {
   const { customer_id, ai_overview } = req.body;
 
@@ -395,8 +776,13 @@ app.post('/api/update-ai', async (req, res) => {
     const query = `
       mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
         metafieldsSet(metafields: $metafields) {
-          metafields { id }
-          userErrors { field message }
+          metafields {
+            id
+          }
+          userErrors {
+            field
+            message
+          }
         }
       }
     `;
@@ -408,37 +794,37 @@ app.post('/api/update-ai', async (req, res) => {
           namespace: 'custom',
           key: 'ai_overview',
           type: 'multi_line_text_field',
-          value: ai_overview
+          value: ai_overview || ''
         }
       ]
     };
 
     await shopifyGraphQL(query, variables);
-    res.json({ success: true });
+
+    return res.json({ success: true });
   } catch (error) {
-    console.error('🚨 AI Sync Failed:', error.message);
-    res.status(500).json({ error: 'Sync Failed' });
+    console.error('AI Sync Failed:', error.message);
+
+    return res.status(500).json({ error: 'Sync Failed' });
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Track123 Hub active on ${PORT}`);
-});
-
 // =====================================================================
-// 5. WISHLIST API (NEW)
+// 6. WISHLIST API
 // =====================================================================
 
-// GET WISHLIST: Returns the array of handles
 app.get('/api/get-wishlist', async (req, res) => {
   const { customerId } = req.query;
-  if (!customerId) return res.status(400).json({ error: 'Missing customerId' });
+
+  if (!customerId) {
+    return res.status(400).json({ error: 'Missing customerId' });
+  }
 
   try {
-    const ownerId = customerId.includes('gid://') ? customerId : `gid://shopify/Customer/${customerId}`;
-    
-    // GraphQL to fetch the specific wishlist metafield
+    const ownerId = customerId.includes('gid://')
+      ? customerId
+      : `gid://shopify/Customer/${customerId}`;
+
     const query = `
       query getCustomerWishlist($id: ID!) {
         customer(id: $id) {
@@ -451,25 +837,28 @@ app.get('/api/get-wishlist', async (req, res) => {
 
     const result = await shopifyGraphQL(query, { id: ownerId });
     const rawValue = result.data?.customer?.metafield?.value;
-    
-    // If it exists, parse it; otherwise return an empty array
     const wishlist = rawValue ? JSON.parse(rawValue) : [];
-    res.json({ wishlist });
+
+    return res.json({ wishlist });
   } catch (error) {
-    console.error('🚨 Get Wishlist Failed:', error.message);
-    res.status(500).json({ error: 'Failed to fetch wishlist' });
+    console.error('Get Wishlist Failed:', error.message);
+
+    return res.status(500).json({ error: 'Failed to fetch wishlist' });
   }
 });
 
-// TOGGLE WISHLIST: Adds or Removes a handle
 app.post('/api/wishlist-toggle', async (req, res) => {
   const { customerId, productHandle } = req.body;
-  if (!customerId || !productHandle) return res.status(400).json({ error: 'Missing data' });
+
+  if (!customerId || !productHandle) {
+    return res.status(400).json({ error: 'Missing data' });
+  }
 
   try {
-    const ownerId = customerId.includes('gid://') ? customerId : `gid://shopify/Customer/${customerId}`;
+    const ownerId = customerId.includes('gid://')
+      ? customerId
+      : `gid://shopify/Customer/${customerId}`;
 
-    // 1. Get current wishlist first
     const getQuery = `
       query getWish($id: ID!) {
         customer(id: $id) {
@@ -479,160 +868,218 @@ app.post('/api/wishlist-toggle', async (req, res) => {
         }
       }
     `;
+
     const currentRes = await shopifyGraphQL(getQuery, { id: ownerId });
     const rawValue = currentRes.data?.customer?.metafield?.value;
-    let wishlist = rawValue ? JSON.parse(rawValue) : [];
 
-    // 2. Logic: Toggle the handle
+    let wishlist = rawValue ? JSON.parse(rawValue) : [];
+    let action;
+
     if (wishlist.includes(productHandle)) {
-      wishlist = wishlist.filter(h => h !== productHandle); // Remove
+      wishlist = wishlist.filter((handle) => handle !== productHandle);
+      action = 'removed';
     } else {
-      wishlist.push(productHandle); // Add
+      wishlist.push(productHandle);
+      action = 'added';
     }
 
-    // 3. Save back to Shopify
     const setQuery = `
       mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
         metafieldsSet(metafields: $metafields) {
-          metafields { id value }
-          userErrors { message }
+          metafields {
+            id
+            value
+          }
+          userErrors {
+            message
+          }
         }
       }
     `;
 
     const variables = {
-      metafields: [{
-        ownerId,
-        namespace: 'custom',
-        key: 'wishlist',
-        type: 'json',
-        value: JSON.stringify(wishlist)
-      }]
+      metafields: [
+        {
+          ownerId,
+          namespace: 'custom',
+          key: 'wishlist',
+          type: 'json',
+          value: JSON.stringify(wishlist)
+        }
+      ]
     };
 
-    await shopifyGraphQL(setQuery, variables);
-    res.json({ success: true, action: wishlist.includes(productHandle) ? 'added' : 'removed', wishlist });
+    const result = await shopifyGraphQL(setQuery, variables);
+    const userErrors = result.data?.metafieldsSet?.userErrors || [];
+
+    if (userErrors.length > 0) {
+      throw new Error(userErrors[0].message);
+    }
+
+    return res.json({
+      success: true,
+      action,
+      wishlist
+    });
   } catch (error) {
-    console.error('🚨 Wishlist Toggle Failed:', error.message);
-    res.status(500).json({ error: 'Toggle failed' });
+    console.error('Wishlist Toggle Failed:', error.message);
+
+    return res.status(500).json({ error: 'Toggle failed' });
   }
 });
 
 // =====================================================================
-// 6. RESTOCK ALERTS API (UPGRADED WITH METAFIELDS)
+// 7. RESTOCK ALERTS API
 // =====================================================================
+
 app.post('/api/restock-alert', async (req, res) => {
-  const { email, tags, action = 'add', metafieldString } = req.body;
-  
+  const {
+    email,
+    tags,
+    action = 'add',
+    metafieldString
+  } = req.body;
+
   if (!email || !tags || !Array.isArray(tags)) {
     return res.status(400).json({ error: 'Missing email or tags array' });
   }
 
   try {
-    // 1. Search Shopify for an existing customer
-    const searchRes = await shopifyGraphQL(`
-      query customerSearch($query: String!) {
-        customers(first: 1, query: $query) {
-          edges {
-            node { id tags }
+    const searchRes = await shopifyGraphQL(
+      `
+        query customerSearch($query: String!) {
+          customers(first: 1, query: $query) {
+            edges {
+              node {
+                id
+                tags
+              }
+            }
           }
         }
+      `,
+      {
+        query: `email:${email}`
       }
-    `, { query: `email:${email}` });
+    );
 
-    const existingCustomer = searchRes.data?.customers?.edges[0]?.node;
+    const existingCustomer = searchRes.data?.customers?.edges?.[0]?.node;
 
-    // 2. Prepare Metafields Payload (Only update if action is 'add' and we have the string)
     const metafieldsPayload = [];
+
     if (metafieldString && action === 'add') {
       metafieldsPayload.push({
-        namespace: "custom",
-        // NOTE: Check your Shopify Admin (Settings -> Custom Data) to confirm if this 
-        // key uses an underscore or a hyphen. It is usually "notification_latest".
-        key: "notification_latest", 
+        namespace: 'custom',
+        key: 'notification_latest',
         value: metafieldString,
-        type: "single_line_text_field"
+        type: 'single_line_text_field'
       });
     }
 
     if (existingCustomer) {
       const currentTags = existingCustomer.tags || [];
+
       let newTags;
 
       if (action === 'remove') {
-        newTags = currentTags.filter(t => !tags.includes(t));
+        newTags = currentTags.filter((tag) => !tags.includes(tag));
       } else {
         newTags = Array.from(new Set([...currentTags, ...tags]));
       }
 
-      // 3. Update the customer profile with Tags AND Metafields
-      const updatePayload = { id: existingCustomer.id, tags: newTags };
+      const updatePayload = {
+        id: existingCustomer.id,
+        tags: newTags
+      };
+
       if (metafieldsPayload.length > 0) {
         updatePayload.metafields = metafieldsPayload;
       }
 
-      const updateRes = await shopifyGraphQL(`
-        mutation customerUpdate($input: CustomerInput!) {
-          customerUpdate(input: $input) {
-            userErrors { message }
-          }
-        }
-      `, { input: updatePayload });
-
-      if (updateRes.data?.customerUpdate?.userErrors?.length > 0) {
-        throw new Error(updateRes.data.customerUpdate.userErrors[0].message);
-      }
-
-    } else {
-      // If customer doesn't exist, we only create on 'add'
-      if (action === 'add') {
-        const createPayload = {
-          email: email,
-          tags: tags,
-          emailMarketingConsent: {
-            marketingState: "SUBSCRIBED",
-            marketingOptInLevel: "SINGLE_OPT_IN"
-          }
-        };
-        if (metafieldsPayload.length > 0) {
-          createPayload.metafields = metafieldsPayload;
-        }
-
-        const createRes = await shopifyGraphQL(`
-          mutation customerCreate($input: CustomerInput!) {
-            customerCreate(input: $input) {
-              userErrors { message }
+      const updateRes = await shopifyGraphQL(
+        `
+          mutation customerUpdate($input: CustomerInput!) {
+            customerUpdate(input: $input) {
+              userErrors {
+                message
+              }
             }
           }
-        `, { input: createPayload });
-
-        if (createRes.data?.customerCreate?.userErrors?.length > 0) {
-          throw new Error(createRes.data.customerCreate.userErrors[0].message);
+        `,
+        {
+          input: updatePayload
         }
+      );
+
+      const userErrors = updateRes.data?.customerUpdate?.userErrors || [];
+
+      if (userErrors.length > 0) {
+        throw new Error(userErrors[0].message);
+      }
+    } else if (action === 'add') {
+      const createPayload = {
+        email,
+        tags,
+        emailMarketingConsent: {
+          marketingState: 'SUBSCRIBED',
+          marketingOptInLevel: 'SINGLE_OPT_IN'
+        }
+      };
+
+      if (metafieldsPayload.length > 0) {
+        createPayload.metafields = metafieldsPayload;
+      }
+
+      const createRes = await shopifyGraphQL(
+        `
+          mutation customerCreate($input: CustomerInput!) {
+            customerCreate(input: $input) {
+              userErrors {
+                message
+              }
+            }
+          }
+        `,
+        {
+          input: createPayload
+        }
+      );
+
+      const userErrors = createRes.data?.customerCreate?.userErrors || [];
+
+      if (userErrors.length > 0) {
+        throw new Error(userErrors[0].message);
       }
     }
 
-    res.json({ success: true, action: action, message: `Alert ${action === 'remove' ? 'removed' : 'saved'} successfully!` });
+    return res.json({
+      success: true,
+      action,
+      message: `Alert ${action === 'remove' ? 'removed' : 'saved'} successfully!`
+    });
   } catch (error) {
-    console.error('🚨 Restock Alert Failed:', error.message);
-    res.status(500).json({ error: 'Failed to update alert' });
+    console.error('Restock Alert Failed:', error.message);
+
+    return res.status(500).json({ error: 'Failed to update alert' });
   }
 });
 
-
 // =====================================================================
-// 7. AI RECOMMENDATIONS PROFILE API (NEW)
+// 8. AI RECOMMENDATIONS PROFILE API
 // =====================================================================
 
-// GET AI PROFILE: Reads the user's flavor/vendor preferences from Shopify
 app.get('/api/get-ai-profile', async (req, res) => {
   const { customerId } = req.query;
-  if (!customerId) return res.status(400).json({ error: 'Missing customerId' });
+
+  if (!customerId) {
+    return res.status(400).json({ error: 'Missing customerId' });
+  }
 
   try {
-    const ownerId = customerId.includes('gid://') ? customerId : `gid://shopify/Customer/${customerId}`;
-    
-    // GraphQL to fetch the AI profile metafield
+    const ownerId = customerId.includes('gid://')
+      ? customerId
+      : `gid://shopify/Customer/${customerId}`;
+
     const query = `
       query getCustomerAIProfile($id: ID!) {
         customer(id: $id) {
@@ -645,52 +1092,78 @@ app.get('/api/get-ai-profile', async (req, res) => {
 
     const result = await shopifyGraphQL(query, { id: ownerId });
     const rawValue = result.data?.customer?.metafield?.value;
-    
-    // If it exists, parse it; otherwise return an empty object
     const profile = rawValue ? JSON.parse(rawValue) : {};
-    res.json({ profile });
+
+    return res.json({ profile });
   } catch (error) {
-    console.error('🚨 Get AI Profile Failed:', error.message);
-    res.status(500).json({ error: 'Failed to fetch AI profile' });
+    console.error('Get AI Profile Failed:', error.message);
+
+    return res.status(500).json({ error: 'Failed to fetch AI profile' });
   }
 });
 
-// SAVE AI PROFILE: Writes the user's flavor/vendor preferences to Shopify
 app.post('/api/save-ai-profile', async (req, res) => {
   const { customerId, profile } = req.body;
-  if (!customerId || !profile) return res.status(400).json({ error: 'Missing data' });
+
+  if (!customerId || !profile) {
+    return res.status(400).json({ error: 'Missing data' });
+  }
 
   try {
-    const ownerId = customerId.includes('gid://') ? customerId : `gid://shopify/Customer/${customerId}`;
+    const ownerId = customerId.includes('gid://')
+      ? customerId
+      : `gid://shopify/Customer/${customerId}`;
 
     const setQuery = `
       mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
         metafieldsSet(metafields: $metafields) {
-          metafields { id value }
-          userErrors { message }
+          metafields {
+            id
+            value
+          }
+          userErrors {
+            message
+          }
         }
       }
     `;
 
     const variables = {
-      metafields: [{
-        ownerId,
-        namespace: 'custom',
-        key: 'ai_profile',
-        type: 'json',
-        value: JSON.stringify(profile) // Store the JS object as a JSON string
-      }]
+      metafields: [
+        {
+          ownerId,
+          namespace: 'custom',
+          key: 'ai_profile',
+          type: 'json',
+          value: JSON.stringify(profile)
+        }
+      ]
     };
 
     const result = await shopifyGraphQL(setQuery, variables);
-    
-    if (result.data?.metafieldsSet?.userErrors?.length > 0) {
-      throw new Error(result.data.metafieldsSet.userErrors[0].message);
+    const userErrors = result.data?.metafieldsSet?.userErrors || [];
+
+    if (userErrors.length > 0) {
+      throw new Error(userErrors[0].message);
     }
 
-    res.json({ success: true, profile });
+    return res.json({
+      success: true,
+      profile
+    });
   } catch (error) {
-    console.error('🚨 Save AI Profile Failed:', error.message);
-    res.status(500).json({ error: 'Failed to save AI profile' });
+    console.error('Save AI Profile Failed:', error.message);
+
+    return res.status(500).json({ error: 'Failed to save AI profile' });
   }
+});
+
+// =====================================================================
+// SERVER START
+// =====================================================================
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Track123 Hub active on ${PORT}`);
 });
