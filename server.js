@@ -9,7 +9,6 @@ app.use(express.json());
 // =====================================================================
 // SHOPIFY HELPERS
 // =====================================================================
-
 function getShopifyDomain() {
   const domain = process.env.SHOPIFY_DOMAIN;
 
@@ -31,10 +30,7 @@ async function getShopifyToken() {
     return process.env.SHOPIFY_ACCESS_TOKEN;
   }
 
-  const {
-    SHOPIFY_CLIENT_ID,
-    SHOPIFY_CLIENT_SECRET
-  } = process.env;
+  const { SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET } = process.env;
 
   if (!SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET) {
     throw new Error(
@@ -44,9 +40,7 @@ async function getShopifyToken() {
 
   const response = await fetch(`https://${getShopifyDomain()}/admin/oauth/access_token`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded'
-    },
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       grant_type: 'client_credentials',
       client_id: SHOPIFY_CLIENT_ID,
@@ -91,12 +85,8 @@ async function shopifyGraphQL(query, variables = {}) {
 // =====================================================================
 // TRACK123 HELPERS
 // =====================================================================
-
 async function callTrack123ShopifyOrder(orderId) {
-  const {
-    TRACK123_STORE_UUID,
-    TRACK123_API_KEY
-  } = process.env;
+  const { TRACK123_STORE_UUID, TRACK123_API_KEY } = process.env;
 
   if (!TRACK123_STORE_UUID || !TRACK123_API_KEY) {
     throw new Error('Missing Track123 credentials in environment.');
@@ -166,7 +156,6 @@ async function callTrack123Tracking(endpoint, body) {
 // =====================================================================
 // GENERAL HELPERS
 // =====================================================================
-
 function normalizeTrackingNumber(value) {
   return String(value || '')
     .replace(/\s+/g, '')
@@ -185,6 +174,132 @@ function getFirstArray(...values) {
   }
 
   return [];
+}
+
+function pickFirst(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null && String(value).trim() !== '') {
+      return value;
+    }
+  }
+
+  return null;
+}
+
+function extractTrack123WebhookInfo(payload = {}) {
+  const data = payload.data || {};
+  const order = payload.order || data.order || {};
+  const tracking = payload.tracking || data.tracking || {};
+  const shipment = payload.shipment || data.shipment || {};
+  const fulfillment = payload.fulfillment || data.fulfillment || {};
+
+  const status = pickFirst(
+    payload.transitStatus,
+    payload.transit_status,
+    payload.deliveryStatus,
+    payload.delivery_status,
+    payload.status,
+    payload.current_status,
+
+    data.transitStatus,
+    data.transit_status,
+    data.deliveryStatus,
+    data.delivery_status,
+    data.status,
+    data.current_status,
+
+    tracking.transitStatus,
+    tracking.transit_status,
+    tracking.deliveryStatus,
+    tracking.delivery_status,
+    tracking.status,
+    tracking.current_status,
+
+    shipment.transitStatus,
+    shipment.transit_status,
+    shipment.deliveryStatus,
+    shipment.delivery_status,
+    shipment.status,
+    shipment.current_status,
+
+    fulfillment.transitStatus,
+    fulfillment.transit_status,
+    fulfillment.deliveryStatus,
+    fulfillment.delivery_status,
+    fulfillment.status,
+    fulfillment.current_status
+  );
+
+  const orderId = pickFirst(
+    payload.orderId,
+    payload.order_id,
+    payload.shopifyOrderId,
+    payload.shopify_order_id,
+    payload.shopify_order_number,
+
+    data.orderId,
+    data.order_id,
+    data.shopifyOrderId,
+    data.shopify_order_id,
+    data.shopify_order_number,
+
+    order.id,
+    order.orderId,
+    order.order_id,
+    order.shopifyOrderId,
+    order.shopify_order_id,
+    order.shopify_order_number,
+
+    tracking.orderId,
+    tracking.order_id,
+    tracking.shopifyOrderId,
+    tracking.shopify_order_id,
+
+    shipment.orderId,
+    shipment.order_id,
+    shipment.shopifyOrderId,
+    shipment.shopify_order_id,
+
+    fulfillment.orderId,
+    fulfillment.order_id,
+    fulfillment.shopifyOrderId,
+    fulfillment.shopify_order_id
+  );
+
+  const orderName = pickFirst(
+    payload.orderName,
+    payload.order_name,
+    payload.name,
+    payload.order_number,
+
+    data.orderName,
+    data.order_name,
+    data.name,
+    data.order_number,
+
+    order.name,
+    order.orderName,
+    order.order_name,
+    order.order_number,
+
+    tracking.orderName,
+    tracking.order_name,
+    tracking.order_number,
+
+    shipment.orderName,
+    shipment.order_name,
+    shipment.order_number,
+
+    fulfillment.orderName,
+    fulfillment.order_name,
+    fulfillment.order_number
+  );
+
+  return {
+    status,
+    orderId,
+    orderName
+  };
 }
 
 function mapTrackingEvent(item) {
@@ -425,11 +540,8 @@ function buildPublicTrackingUrl(carrier, trackingNumber, fallbackUrl = '') {
 // =====================================================================
 // DELIVERED ORDER TAG HELPERS
 // =====================================================================
-
 const DELIVERED_ORDER_TAG = process.env.DELIVERED_ORDER_TAG || 'delivered';
-
-const TAG_ORDER_ON_PARTIAL_DELIVERY =
-  String(process.env.TAG_ORDER_ON_PARTIAL_DELIVERY || '').toLowerCase() === 'true';
+const TAG_ORDER_ON_PARTIAL_DELIVERY = String(process.env.TAG_ORDER_ON_PARTIAL_DELIVERY || '').toLowerCase() === 'true';
 
 function toShopifyOrderGid(orderId) {
   const value = String(orderId || '').trim();
@@ -499,10 +611,7 @@ async function findShopifyOrderGidByName(orderName) {
   ];
 
   for (const searchQuery of attempts) {
-    const result = await shopifyGraphQL(query, {
-      query: searchQuery
-    });
-
+    const result = await shopifyGraphQL(query, { query: searchQuery });
     const order = result.data?.orders?.edges?.[0]?.node;
 
     if (order?.id) {
@@ -649,7 +758,6 @@ async function safelyTagDeliveredOrder(raw, normalized) {
 // =====================================================================
 // 1. ORDER-BASED TRACKING API
 // =====================================================================
-
 app.get('/api/order-tracking', async (req, res) => {
   const { order_id, tracking_num } = req.query;
 
@@ -689,7 +797,6 @@ app.get('/api/order-tracking', async (req, res) => {
 // =====================================================================
 // 2. LEGACY TRACKING ROUTE
 // =====================================================================
-
 app.get('/api/track', async (req, res) => {
   const { number, order_id, carrier } = req.query;
 
@@ -780,17 +887,8 @@ app.get('/api/track', async (req, res) => {
       history: trackingDetails.map(mapTrackingEvent),
       history_count: trackingDetails.length,
       order: {
-        order_id:
-          item.order_id ||
-          item.orderId ||
-          item.shopify_order_id ||
-          item.shopifyOrderId ||
-          null,
-        order_name:
-          item.order_name ||
-          item.orderName ||
-          item.name ||
-          null
+        order_id: item.order_id || item.orderId || item.shopify_order_id || item.shopifyOrderId || null,
+        order_name: item.order_name || item.orderName || item.name || null
       },
       fulfillment: {
         tracking_number: item.tracking_number || item.trackingNumber || cleanNumber,
@@ -841,20 +939,12 @@ app.get('/api/track', async (req, res) => {
 // =====================================================================
 // 3. SHOPIFY FULFILLMENT WEBHOOK
 // =====================================================================
-
 app.post('/api/webhooks/fulfillment', async (req, res) => {
   res.status(200).send('OK');
 
   try {
-    const {
-      tracking_number,
-      tracking_numbers,
-      tracking_company
-    } = req.body;
-
-    const num =
-      tracking_number ||
-      (Array.isArray(tracking_numbers) ? tracking_numbers[0] : null);
+    const { tracking_number, tracking_numbers, tracking_company } = req.body;
+    const num = tracking_number || (Array.isArray(tracking_numbers) ? tracking_numbers[0] : null);
 
     if (!num) {
       return;
@@ -872,37 +962,26 @@ app.post('/api/webhooks/fulfillment', async (req, res) => {
 // Webhook URL:
 // https://YOUR-SERVER-DOMAIN/api/webhooks/track123
 // =====================================================================
-
 app.post('/api/webhooks/track123', async (req, res) => {
   res.status(200).send('OK');
 
   try {
     const payload = req.body || {};
 
-    const transitStatus =
-      payload.transitStatus ||
-      payload.transit_status ||
-      payload.status ||
-      payload.deliveryStatus ||
-      payload.delivery_status ||
-      '';
+    console.log('Track123 webhook received:', JSON.stringify(payload, null, 2));
 
-    if (!isDeliveredText(transitStatus)) {
+    const { status, orderId, orderName } = extractTrack123WebhookInfo(payload);
+
+    console.log('Track123 webhook extracted info:', {
+      status,
+      orderId,
+      orderName
+    });
+
+    if (!isDeliveredText(status)) {
+      console.log('Track123 webhook skipped: not delivered');
       return;
     }
-
-    const orderId =
-      payload.orderId ||
-      payload.order_id ||
-      payload.shopifyOrderId ||
-      payload.shopify_order_id ||
-      null;
-
-    const orderName =
-      payload.orderName ||
-      payload.order_name ||
-      payload.name ||
-      null;
 
     const update = await addDeliveredTagToShopifyOrder(orderId, orderName);
 
@@ -915,7 +994,6 @@ app.post('/api/webhooks/track123', async (req, res) => {
 // =====================================================================
 // 5. AI PROFILE SYNC
 // =====================================================================
-
 app.post('/api/update-ai', async (req, res) => {
   const { customer_id, ai_overview } = req.body;
 
@@ -959,7 +1037,6 @@ app.post('/api/update-ai', async (req, res) => {
     return res.json({ success: true });
   } catch (error) {
     console.error('AI Sync Failed:', error.message);
-
     return res.status(500).json({ error: 'Sync Failed' });
   }
 });
@@ -967,7 +1044,6 @@ app.post('/api/update-ai', async (req, res) => {
 // =====================================================================
 // 6. WISHLIST API
 // =====================================================================
-
 app.get('/api/get-wishlist', async (req, res) => {
   const { customerId } = req.query;
 
@@ -997,7 +1073,6 @@ app.get('/api/get-wishlist', async (req, res) => {
     return res.json({ wishlist });
   } catch (error) {
     console.error('Get Wishlist Failed:', error.message);
-
     return res.status(500).json({ error: 'Failed to fetch wishlist' });
   }
 });
@@ -1071,14 +1146,9 @@ app.post('/api/wishlist-toggle', async (req, res) => {
       throw new Error(userErrors[0].message);
     }
 
-    return res.json({
-      success: true,
-      action,
-      wishlist
-    });
+    return res.json({ success: true, action, wishlist });
   } catch (error) {
     console.error('Wishlist Toggle Failed:', error.message);
-
     return res.status(500).json({ error: 'Toggle failed' });
   }
 });
@@ -1086,14 +1156,8 @@ app.post('/api/wishlist-toggle', async (req, res) => {
 // =====================================================================
 // 7. RESTOCK ALERTS API
 // =====================================================================
-
 app.post('/api/restock-alert', async (req, res) => {
-  const {
-    email,
-    tags,
-    action = 'add',
-    metafieldString
-  } = req.body;
+  const { email, tags, action = 'add', metafieldString } = req.body;
 
   if (!email || !tags || !Array.isArray(tags)) {
     return res.status(400).json({ error: 'Missing email or tags array' });
@@ -1113,13 +1177,10 @@ app.post('/api/restock-alert', async (req, res) => {
           }
         }
       `,
-      {
-        query: `email:${email}`
-      }
+      { query: `email:${email}` }
     );
 
     const existingCustomer = searchRes.data?.customers?.edges?.[0]?.node;
-
     const metafieldsPayload = [];
 
     if (metafieldString && action === 'add') {
@@ -1133,7 +1194,6 @@ app.post('/api/restock-alert', async (req, res) => {
 
     if (existingCustomer) {
       const currentTags = existingCustomer.tags || [];
-
       let newTags;
 
       if (action === 'remove') {
@@ -1161,9 +1221,7 @@ app.post('/api/restock-alert', async (req, res) => {
             }
           }
         `,
-        {
-          input: updatePayload
-        }
+        { input: updatePayload }
       );
 
       const userErrors = updateRes.data?.customerUpdate?.userErrors || [];
@@ -1195,9 +1253,7 @@ app.post('/api/restock-alert', async (req, res) => {
             }
           }
         `,
-        {
-          input: createPayload
-        }
+        { input: createPayload }
       );
 
       const userErrors = createRes.data?.customerCreate?.userErrors || [];
@@ -1214,7 +1270,6 @@ app.post('/api/restock-alert', async (req, res) => {
     });
   } catch (error) {
     console.error('Restock Alert Failed:', error.message);
-
     return res.status(500).json({ error: 'Failed to update alert' });
   }
 });
@@ -1222,7 +1277,6 @@ app.post('/api/restock-alert', async (req, res) => {
 // =====================================================================
 // 8. AI RECOMMENDATIONS PROFILE API
 // =====================================================================
-
 app.get('/api/get-ai-profile', async (req, res) => {
   const { customerId } = req.query;
 
@@ -1252,7 +1306,6 @@ app.get('/api/get-ai-profile', async (req, res) => {
     return res.json({ profile });
   } catch (error) {
     console.error('Get AI Profile Failed:', error.message);
-
     return res.status(500).json({ error: 'Failed to fetch AI profile' });
   }
 });
@@ -1302,13 +1355,9 @@ app.post('/api/save-ai-profile', async (req, res) => {
       throw new Error(userErrors[0].message);
     }
 
-    return res.json({
-      success: true,
-      profile
-    });
+    return res.json({ success: true, profile });
   } catch (error) {
     console.error('Save AI Profile Failed:', error.message);
-
     return res.status(500).json({ error: 'Failed to save AI profile' });
   }
 });
@@ -1316,7 +1365,6 @@ app.post('/api/save-ai-profile', async (req, res) => {
 // =====================================================================
 // SERVER START
 // =====================================================================
-
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, '0.0.0.0', () => {
