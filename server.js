@@ -1363,6 +1363,380 @@ app.post('/api/save-ai-profile', async (req, res) => {
 });
 
 // =====================================================================
+// 9. DELIVERED ORDER BACKFILL
+// Manually checks previous Shopify orders against Track123 and tags
+// delivered orders.
+// =====================================================================
+
+function parsePositiveInt(value, fallback, min, max) {
+  const number = parseInt(value, 10);
+
+  if (Number.isNaN(number)) {
+    return fallback;
+  }
+
+  return Math.min(Math.max(number, min), max);
+}
+
+function isTrue(value) {
+  return String(value || '').toLowerCase() === 'true';
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getLegacyOrderId(order) {
+  if (order?.legacyResourceId) {
+    return String(order.legacyResourceId);
+  }
+
+  return String(order?.id || '').split('/').pop();
+}
+
+function attachShopifyOrderIdentityToTrack123Raw(raw, shopifyOrder) {
+  const clonedRaw = raw && typeof raw === 'object'
+    ? JSON.parse(JSON.stringify(raw))
+    : {};
+
+  const existingOrder = clonedRaw.order && typeof clonedRaw.order === 'object'
+    ? clonedRaw.order
+    : clonedRaw;
+
+  const legacyOrderId = getLegacyOrderId(shopifyOrder);
+
+  clonedRaw.order = {
+    ...existingOrder,
+    id: existingOrder.id || legacyOrderId,
+    order_id:
+      existingOrder.order_id ||
+      existingOrder.orderId ||
+      existingOrder.shopify_order_id ||
+      existingOrder.shopifyOrderId ||
+      legacyOrderId,
+    order_name:
+      existingOrder.order_name ||
+      existingOrder.orderName ||
+      existingOrder.name ||
+      shopifyOrder.name
+  };
+
+  return clonedRaw;
+}
+
+function buildBackfillOrderSearchQuery({
+  since,
+  until,
+  fulfillmentStatus
+}) {
+  const filters = [
+    `tag_not:${DELIVERED_ORDER_TAG}`
+  ];
+
+  if (since) {
+    filters.push(`created_at:>=${since}`);
+  }
+
+  if (until) {
+    filters.push(`created_at:<=${until}`);
+  }
+
+  if (fulfillmentStatus && fulfillmentStatus !== 'any') {
+    filters.push(`fulfillment_status:${fulfillmentStatus}`);
+  }
+
+  return filters.join(' ');
+}
+
+async function getOrdersForDeliveredBackfill({
+  first,
+  after,
+  since,
+  until,
+  fulfillmentStatus
+}) {
+  const searchQuery = buildBackfillOrderSearchQuery({
+    since,
+    until,
+    fulfillmentStatus
+  });
+
+  const query = `
+    query BackfillDeliveredOrders($first: Int!, $after: String, $query: String!) {
+      orders(first: $first, after: $after, query: $query, sortKey: CREATED_AT, reverse: true) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        edges {
+          cursor
+          node {
+            id
+            legacyResourceId
+            name
+            createdAt
+            displayFulfillmentStatus
+            tags
+            fulfillments(first: 10) {
+              id
+              status
+              displayStatus
+              deliveredAt
+              trackingInfo {
+                number
+                company
+                url
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const result = await shopifyGraphQL(query, {
+    first,
+    after: after || null,
+    query: searchQuery
+  });
+
+  return {
+    searchQuery,
+    edges: result.data?.orders?.edges || [],
+    pageInfo: result.data?.orders?.pageInfo || {
+      hasNextPage: false,
+      endCursor: null
+    }
+  };
+}
+
+async function handleDeliveredOrderBackfill(req, res) {
+  const input = {
+    ...(req.query || {}),
+    ...(req.body || {})
+  };
+
+  const providedSecret = input.secret || req.headers['x-backfill-secret'];
+
+  if (!process.env.BACKFILL_SECRET) {
+    return res.status(500).json({
+      success: false,
+      error: 'Missing BACKFILL_SECRET environment variable'
+    });
+  }
+
+  if (providedSecret !== process.env.BACKFILL_SECRET) {
+    return res.status(401).json({
+      success: false,
+      error: 'Unauthorized'
+    });
+  }
+
+  const limit = parsePositiveInt(input.limit, 25, 1, 50);
+  const maxPages = parsePositiveInt(input.max_pages, 1, 1, 20);
+  const delayMs = parsePositiveInt(input.delay_ms, 300, 0, 5000);
+
+  const since = input.since || null;
+  const until = input.until || null;
+  const fulfillmentStatus = input.fulfillment_status || 'fulfilled';
+  const dryRun = isTrue(input.dry_run);
+
+  let after = input.cursor || null;
+  let lastPageInfo = {
+    hasNextPage: false,
+    endCursor: null
+  };
+
+  const totals = {
+    scanned: 0,
+    checkedTrack123: 0,
+    tagged: 0,
+    wouldTag: 0,
+    skipped: 0,
+    failed: 0
+  };
+
+  const results = [];
+
+  try {
+    for (let page = 1; page <= maxPages; page += 1) {
+      const shopifyPage = await getOrdersForDeliveredBackfill({
+        first: limit,
+        after,
+        since,
+        until,
+        fulfillmentStatus
+      });
+
+      lastPageInfo = shopifyPage.pageInfo;
+
+      if (shopifyPage.edges.length === 0) {
+        break;
+      }
+
+      for (const edge of shopifyPage.edges) {
+        const order = edge.node;
+        totals.scanned += 1;
+
+        const orderResult = {
+          shopifyOrderId: order.id,
+          legacyOrderId: getLegacyOrderId(order),
+          name: order.name,
+          createdAt: order.createdAt,
+          displayFulfillmentStatus: order.displayFulfillmentStatus,
+          track123Status: null,
+          shopifyTagUpdate: null
+        };
+
+        try {
+          if ((order.tags || []).includes(DELIVERED_ORDER_TAG)) {
+            totals.skipped += 1;
+
+            orderResult.shopifyTagUpdate = {
+              success: false,
+              skipped: true,
+              reason: 'already_tagged'
+            };
+
+            results.push(orderResult);
+            continue;
+          }
+
+          const legacyOrderId = getLegacyOrderId(order);
+
+          if (!legacyOrderId) {
+            totals.failed += 1;
+
+            orderResult.shopifyTagUpdate = {
+              success: false,
+              skipped: false,
+              reason: 'missing_legacy_order_id'
+            };
+
+            results.push(orderResult);
+            continue;
+          }
+
+          const raw = await callTrack123ShopifyOrder(legacyOrderId);
+          totals.checkedTrack123 += 1;
+
+          const rawForTagging = attachShopifyOrderIdentityToTrack123Raw(raw, order);
+          const normalized = normalizeTrack123OrderResponse(rawForTagging);
+
+          if (normalized.fulfillment) {
+            normalized.fulfillment.tracking_link = buildPublicTrackingUrl(
+              normalized.fulfillment.tracking_company,
+              normalized.fulfillment.tracking_number,
+              normalized.fulfillment.tracking_link
+            );
+          }
+
+          orderResult.track123Status = {
+            found: normalized.found,
+            status: normalized.status,
+            transitStatus: normalized.fulfillment?.transit_status || '',
+            lastEvent: normalized.fulfillment?.last_event || '',
+            trackingNumber: normalized.fulfillment?.tracking_number || ''
+          };
+
+          if (dryRun) {
+            const wouldTag =
+              normalized.found &&
+              allKnownFulfillmentsDelivered(rawForTagging, normalized);
+
+            if (wouldTag) {
+              totals.wouldTag += 1;
+            } else {
+              totals.skipped += 1;
+            }
+
+            orderResult.shopifyTagUpdate = {
+              success: false,
+              skipped: true,
+              dryRun: true,
+              wouldTag
+            };
+
+            results.push(orderResult);
+
+            if (delayMs > 0) {
+              await sleep(delayMs);
+            }
+
+            continue;
+          }
+
+          const update = await safelyTagDeliveredOrder(rawForTagging, normalized);
+
+          orderResult.shopifyTagUpdate = update;
+
+          if (update.success) {
+            totals.tagged += 1;
+          } else if (update.skipped) {
+            totals.skipped += 1;
+          } else {
+            totals.failed += 1;
+          }
+
+          results.push(orderResult);
+
+          if (delayMs > 0) {
+            await sleep(delayMs);
+          }
+        } catch (error) {
+          totals.failed += 1;
+
+          orderResult.shopifyTagUpdate = {
+            success: false,
+            skipped: false,
+            reason: 'backfill_order_failed',
+            message: error.message
+          };
+
+          results.push(orderResult);
+        }
+      }
+
+      if (!lastPageInfo.hasNextPage) {
+        break;
+      }
+
+      after = lastPageInfo.endCursor;
+    }
+
+    return res.json({
+      success: true,
+      dryRun,
+      filters: {
+        since,
+        until,
+        fulfillmentStatus,
+        deliveredTag: DELIVERED_ORDER_TAG
+      },
+      pagination: {
+        hasNextPage: lastPageInfo.hasNextPage,
+        nextCursor: lastPageInfo.endCursor
+      },
+      totals,
+      results
+    });
+  } catch (error) {
+    console.error('Delivered order backfill failed:', error.message);
+
+    return res.status(500).json({
+      success: false,
+      error: 'Delivered order backfill failed',
+      message: error.message,
+      totals,
+      results
+    });
+  }
+}
+
+app.get('/api/backfill-delivered-orders', handleDeliveredOrderBackfill);
+app.post('/api/backfill-delivered-orders', handleDeliveredOrderBackfill);
+
+// =====================================================================
 // SERVER START
 // =====================================================================
 const PORT = process.env.PORT || 3000;
